@@ -1,0 +1,13 @@
+---
+description: Use SSH only for GitHub git/gh operations
+alwaysApply: true
+---
+
+# GitHub via SSH
+
+- Remotes must be `git@github.com:...` — never switch to HTTPS to “fix” auth.
+- Before `fetch` / `pull` / `push` / `gh` remote ops, run SSH preflight:
+  `ensure-github-ssh.ps1` from the github-ssh skill.
+- Exit 1 (key not loaded): ask the user to run in **their** terminal:
+  `& $env:USERPROFILE\.ssh\2-add-ssh-key.ps1`
+- Do not prompt for SSH passphrase in chat.

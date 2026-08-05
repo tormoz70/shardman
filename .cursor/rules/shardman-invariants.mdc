@@ -1,0 +1,18 @@
+---
+description: Shardman domain invariants — range sharding, FSM, control plane
+alwaysApply: true
+---
+
+# Shardman invariants
+
+- **Control plane only:** resolve topology via HTTP; apps talk to Postgres directly.
+- **Range MVP:** `period_axis` is `time` or `numeric`; chosen at bootstrap; never change live.
+- **No rebalance:** full shard → `sealed`; next `standby` → `active` for the same `period_id`.
+- **Single active per period:** enforce with DB partial unique index + transactional seal-rotate.
+- **FSM:** only `standby → active → sealed`. Reject register as `active`/`sealed`.
+- **Write path:** `shard_key → period_id → active`. Missing active → auto-promote or `503`.
+- **Read path:** return `sealed ∪ active` for the period; never `standby`.
+- **Seal signal:** agent `reported_bytes`; without agent use manual `seal-rotate`.
+- **Fail-open MVP:** if no standby when full, keep writing to active and alert (`standby_exhausted`).
+
+Do not invent SQL proxy, cross-shard migrations, or mode switching without updating `.ai/master-spec.yaml`.

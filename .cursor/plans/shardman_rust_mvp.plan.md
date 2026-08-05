@@ -203,3 +203,12 @@ shardman/
 4. Agent + CLI
 5. Prometheus/Grafana compose + integration tests
 6. Docs / master-spec
+
+## Git / GitHub
+
+Все взаимодействия с GitHub — **только по SSH** (`git@github.com:...`), не HTTPS.
+
+- remote: `git@github.com:<org>/shardman.git`
+- перед `fetch` / `pull` / `push` / `gh`: SSH preflight (`ensure-github-ssh.ps1` из skill github-ssh)
+- при `Permission denied (publickey)` — не переключаться на HTTPS; чинить SSH-agent / ключ
+- `gh` использовать с SSH-контекстом репозитория

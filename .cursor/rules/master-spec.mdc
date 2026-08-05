@@ -1,0 +1,20 @@
+---
+description: Pointer to Shardman agent master-spec (SoT for domain and guardrails)
+alwaysApply: true
+---
+
+# Master spec
+
+Before changing API, invariants, sharding semantics, or acceptance:
+
+1. Read and follow **`.ai/master-spec.yaml`** (agent source of truth).
+2. Keep **`docs/master-spec.md`** in sync in the same change.
+3. Bump `version` / `last_updated` in the YAML when contracts change.
+
+Hard rules (summary):
+
+- MVP = control plane only (no SQL proxy, no tenant-per-shard).
+- `period_axis` / `period_spec` / `mode` immutable after bootstrap.
+- Exactly one `active` shard per `period_id`; FSM `standby → active → sealed`.
+- Hot-add only as `standby`; admin/internal need `CLUSTER_KEY`.
+- GitHub remotes: SSH only — never fall back to HTTPS on key errors.

@@ -167,10 +167,12 @@ shardman/
 
 ## Docs (минимум)
 
-- `docs/sharding-model.md` — range periods + lifecycle
-- `docs/architecture.md` — control plane vs data plane
-- `README.md` — quick start
-- `.ai/master-spec.yaml` — SoT для агентов (как в LBF)
+- [x] `.ai/master-spec.yaml` — SoT для агентов
+- [x] `docs/master-spec.md` — human product contract
+- [x] `.cursor/rules/*` — master-spec pointer, invariants, rust, github-ssh
+- [ ] `docs/sharding-model.md` — range periods + lifecycle
+- [ ] `docs/architecture.md` — control plane vs data plane
+- [ ] `README.md` — quick start
 
 ## Out of MVP
 
@@ -189,3 +191,12 @@ shardman/
 4. Agent + CLI
 5. Prometheus/Grafana compose + integration tests
 6. Docs / master-spec
+
+## Git / GitHub
+
+Все взаимодействия с GitHub — **только по SSH** (`git@github.com:...`), не HTTPS.
+
+- remote: `git@github.com:<org>/shardman.git`
+- перед `fetch` / `pull` / `push` / `gh`: SSH preflight (`ensure-github-ssh.ps1` из skill github-ssh)
+- при `Permission denied (publickey)` — не переключаться на HTTPS; чинить SSH-agent / ключ
+- `gh` использовать с SSH-контекстом репозитория
