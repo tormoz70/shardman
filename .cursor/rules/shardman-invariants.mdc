@@ -12,7 +12,8 @@ alwaysApply: true
 - **FSM:** only `standby → active → sealed`. Reject register as `active`/`sealed`.
 - **Write path:** `shard_key → period_id → active`. Missing active → auto-promote or `503`.
 - **Read path:** return `sealed ∪ active` for the period; never `standby`.
-- **Seal signal:** agent `reported_bytes`; without agent use manual `seal-rotate`.
-- **Fail-open MVP:** if no standby when full, keep writing to active and alert (`standby_exhausted`).
+- **Time retention:** `retention_depth`, pool `depth+1+max_future_periods+1(error)`; evicted periods cleaned and recycled.
+- **`max_future_periods`:** 0 → future data goes to error shard; N → allow N future periods.
+- **Error shard:** one `role=error`, quarantine for out-of-model writes; never retention-cleaned.
 
 Do not invent SQL proxy, cross-shard migrations, or mode switching without updating `.ai/master-spec.yaml`.

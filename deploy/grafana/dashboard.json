@@ -1,0 +1,40 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "title": "Shardman",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Standby pool",
+      "targets": [
+        {
+          "expr": "shardman_standby_pool_size"
+        }
+      ],
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+    },
+    {
+      "type": "graph",
+      "title": "Seal total",
+      "targets": [
+        {
+          "expr": "sum(shardman_seal_total)"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 6, "y": 0}
+    },
+    {
+      "type": "graph",
+      "title": "Error routes",
+      "targets": [
+        {
+          "expr": "sum by (reason) (shardman_error_route_total)"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

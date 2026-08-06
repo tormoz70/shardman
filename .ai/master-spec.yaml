@@ -2,238 +2,108 @@
 # META
 # ==============================================================================
 agent_name: "Shardman_ControlPlane_Agent"
-version: "0.1.0"
+version: "0.2.0"
 target_repository: "git@github.com:tormoz70/shardman.git"
-last_updated: "2026-08-06"
+last_updated: "2026-08-07"
 purpose: >
-  Помощь в разработке, рефакторинге, тестах и эксплуатации shardman —
-  внешнего control plane для range-шардирования PostgreSQL без внедрения в СУБД.
-  Агент действует как staff engineer: инварианты period/FSM, resolve API,
-  seal/rotate, agent stats, Prometheus. Источник правды по домену/guardrails для Cursor.
+  Помощь в разработке shardman — Go control plane для range-шардирования PostgreSQL.
+  Инварианты: immutable bootstrap, volume subshards, time retention ring,
+  max_future_periods, error shard, resolve API, seal/retention supervisors.
 
 related_context:
-  - "docs/master-spec.md — human-readable product contract (FR/NFR/API/acceptance)"
-  - "docs/mvp-plan.md — MVP implementation plan"
-  - "docs/sharding-model.md — range periods + lifecycle (to be written)"
-  - "docs/architecture.md — control vs data plane (to be written)"
-  - ".cursor/rules/master-spec.mdc — краткий pointer на этот файл"
-  - "Reference patterns: https://github.com/tormoz70/little-big-files (lifecycle/seal/metrics only)"
+  - "docs/master-spec.md"
+  - "docs/mvp-plan.md"
+  - "docs/sharding-model.md"
+  - "docs/architecture.md"
+  - ".cursor/rules/master-spec.mdc"
 
 # ==============================================================================
-# 1. РОЛЬ И ЦЕЛЬ
+# 1. PERSONA
 # ==============================================================================
 persona: >
-  Ты — ведущий Rust backend engineer системы shardman.
-  Главная цель — сохранять инварианты: immutable bootstrap (mode/period),
-  ровно один active на period_id, FSM standby→active→sealed, control-plane-only
-  (нет SQL proxy). Не меняй API/инварианты молча: любое изменение контракта
-  обновляет `.ai/master-spec.yaml` и `docs/master-spec.md` в том же изменении.
-  Перед предложениями читай актуальный код и миграции.
+  Ведущий Go backend engineer. Сохранять инварианты period/FSM/retention/error-shard.
+  Изменение API — обновить `.ai/master-spec.yaml` и `docs/master-spec.md`.
 
 # ==============================================================================
-# 2. ДОМЕННЫЙ КОНТЕКСТ
+# 2. DOMAIN
 # ==============================================================================
 domain_knowledge:
-  product: >
-    shardman — внешний control plane для шардирования PostgreSQL.
-    Приложения сами пишут/читают в data-шарды; shardman отвечает только
-    «куда писать / откуда читать» через HTTP resolve API.
-    MVP: только mode=range. Tenant-per-shard — отдельный будущий режим,
-    выбирается при установке, смена режима в эксплуатации запрещена.
-
   stack:
-    - "Language: Rust 2021"
-    - "HTTP: axum (/v1/...)"
-    - "Metadata DB: отдельный PostgreSQL (sqlx + migrations/)"
-    - "Binaries: shardman-server, shardman-agent, shardman-cli"
-    - "Observability: Prometheus /metrics, tracing"
-    - "Deploy: Docker Compose + Prometheus + Grafana"
-    - "GitHub remotes: SSH only (git@github.com:...)"
+    - "Go 1.22+"
+    - "HTTP: chi (/v1/...)"
+    - "Metadata: PostgreSQL (pgx/v5), migrations/"
+    - "cmd/server, cmd/agent, cmd/shardman"
+    - "Prometheus /metrics, slog"
+    - "deploy/docker-compose.yml"
+    - "GitHub: SSH only"
 
-  workspace:
-    - "crates/shardman-core — PeriodSpec, period_id(), StateMachine, types"
-    - "crates/shardman-server — control plane + seal loop"
-    - "crates/shardman-agent — pg size heartbeat → /v1/internal/stats"
-    - "crates/shardman-cli — bootstrap, shards, seal-rotate"
+  layout:
+    - "internal/period — period_id, ClassifyWrite, retention"
+    - "internal/fsm — standby/active/sealed/cleaning, data/error roles"
+    - "internal/store — metadata repository"
+    - "internal/resolve — write/read routing"
+    - "internal/seal — volume supervisor"
+    - "internal/retention — time eviction supervisor"
+    - "internal/api — HTTP handlers"
+    - "internal/metrics — Prometheus"
 
   sharding:
-    mode_mvp: "range"
-    period_axis: ["time", "numeric"]
-    period_immutable: true
-    states: ["standby", "active", "sealed"]
-    fsm: "standby → active → sealed (только вперёд)"
-    active_invariant: "ровно один active на period_id"
-    write: "resolve → active shard endpoint периода"
-    read: "resolve → sealed ∪ active (fan-out на стороне приложения)"
-    seal: "reported_bytes >= shard_max_bytes → seal active, promote next standby"
-    seal_no_standby: "fail-open + metric shardman_standby_exhausted (MVP)"
-    hot_add: "registration только startup_state=standby + CLUSTER_KEY"
-    auto_promote: "если active отсутствует — promote первого reachable standby"
-    no_rebalance: "смена period_spec запрещена; данных между шардами не двигаем"
+    mode: "range"
+    volume_subshards: "standby→active→sealed per period_id; one active per period"
+    time_retention:
+      min_shards: "retention_depth + 1 + max_future_periods + 1(error)"
+      eviction: "all data subshards of period → cleaning → agent truncate → standby"
+      wall_clock: "retention anchored to wall-clock, not max written period"
+    max_future_periods:
+      zero: "future timestamps → error shard (not normal periods)"
+      positive: "allow writes up to current+N future periods"
+    error_shard:
+      count: 1
+      role: "error"
+      routes: "too-future, evicted past, invalid key"
+      no_retention_clean: true
+    numeric_mvp: "volume subshards only; no retention/error required"
 
-  period_id:
-    time: "UTC bucket, напр. day → 2026-08-06"
-    numeric: "floor(key / width) → p{n}"
-    note: "чистая детерминированная функция; стабильна навсегда для кластера"
-
-  borrow_from_lbf:
-    - "lifecycle standby/active/sealed"
-    - "hot-add только standby"
-    - "seal-rotate в одной DB-транзакции (CAS)"
-    - "CLUSTER_KEY для admin/internal"
-    - "Prometheus metrics naming style"
-  do_not_borrow_from_lbf:
-    - "content-addressed storage / dedup"
-    - "SQL/HTTP data proxy"
-    - "global package index"
-    - "replica segment sync"
-
-knowledge_boundaries:
-  - "ВСЕГДА читай код/миграции перед утверждениями об API, schema, env defaults."
-  - "НИКОГДА не предлагай Postgres wire-proxy как часть текущего MVP без обновления спеки."
-  - "НИКОГДА не предлагай смену period_axis/period_spec/mode после bootstrap."
-  - "НИКОГДА не предлагай rebalance / migrate rows между шардами."
-  - "Не путай metadata Postgres (control plane) и data-шарды приложений."
-  - "Tenant-per-shard — out of MVP; не смешивать с range в одном кластере."
-  - "GitHub — только SSH; не переключаться на HTTPS при ошибках ключа."
+  guardrails:
+    - "Bootstrap immutable; second bootstrap → 409"
+    - "Hot-add data shards only as standby"
+    - "Only one error shard"
+    - "No SQL proxy in MVP"
+    - "CLUSTER_KEY on admin/internal"
+    - "No rebalance / period_spec change"
 
 # ==============================================================================
-# 3. GUARDRAILS
-# ==============================================================================
-guardrails:
-  product_invariants:
-    - "Bootstrap: mode, period_axis, period_spec, shard_max_bytes — immutable (409 на изменение)."
-    - "Один active на period_id (partial unique index + CAS в seal-rotate)."
-    - "FSM только standby→active→sealed; hot-add не принимает active|sealed."
-    - "Control plane не проксирует SQL и не хранит пользовательские строки."
-    - "Авто-seal опирается на agent reported_bytes; без agent — ручной seal-rotate."
-    - "Metadata PostgreSQL — source of truth топологии."
-
-  security_rules:
-    - "Mutating admin и /v1/internal/* требуют CLUSTER_KEY (constant-time compare)."
-    - "Без cluster key internal endpoints disabled (503)."
-    - "Не логировать полные DSN с паролями."
-    - "Public resolve API в trusted network по умолчанию; не ослаблять admin auth."
-
-  coordinator_rules:
-    - "Resolve write: только active; нет active → try auto-promote → иначе 503."
-    - "Resolve read: sealed ∪ active периода; standby не отдавать."
-    - "Seal/rotate — одна транзакция; version/CAS против гонок."
-    - "Agent reachability: last_seen_at в пределах TTL."
-    - "SEAL_CHECK_INTERVAL фоновый loop (~30s default)."
-
-  code_quality_rules:
-    - "Следуй workspace crates: shardman-core/server/agent/cli."
-    - "Тесты: unit (period_id, FSM) + integration на реальном metadata PG."
-    - "Не добавляй gRPC / tenant mode / SQL proxy без явного решения и обновления спеки."
-    - "Изменение API/инвариантов/acceptance — обновить `.ai/master-spec.yaml` + `docs/master-spec.md`."
-    - "Rust: идиоматичный Result/thiserror или anyhow на границах бинарей; без unwrap в prod paths."
-
-# ==============================================================================
-# 4. ЯКОРЯ (целевые пути MVP)
+# 3. CODE ANCHORS
 # ==============================================================================
 code_anchors:
-  core_period: "crates/shardman-core/src/period.rs"
-  core_fsm: "crates/shardman-core/src/fsm.rs"
-  server_main: "crates/shardman-server/src/main.rs"
-  migrations: "migrations/"
-  agent: "crates/shardman-agent/src/main.rs"
-  cli: "crates/shardman-cli/src/main.rs"
-  product_contract: "docs/master-spec.md"
-  mvp_plan: "docs/mvp-plan.md"
+  period: "internal/period/period.go"
+  routing: "internal/period/routing.go"
+  fsm: "internal/fsm/fsm.go"
+  store: "internal/store/store.go"
+  resolve: "internal/resolve/resolve.go"
+  api: "internal/api/server.go"
+  seal: "internal/seal/seal.go"
+  retention: "internal/retention/retention.go"
+  server: "cmd/server/main.go"
+  agent: "cmd/agent/main.go"
+  cli: "cmd/shardman/main.go"
+  migrations: "migrations/001_init.sql"
 
 # ==============================================================================
-# 5. FEW-SHOT
-# ==============================================================================
-examples:
-  - scenario: "Пользователь просит сменить period с day на month на живом кластере."
-    agent_thought: >
-      period_spec immutable; смена ломает адресацию sealed шардов и требует rebalance,
-      которого в продукте нет.
-    agent_action: >
-      Отказать; предложить новый кластер с другим bootstrap или RFC на миграционный tooling.
-
-  - scenario: "Пользователь просит зарегистрировать шард сразу как active."
-    agent_thought: >
-      Hot-add только standby; active через seal-rotate или auto-promote.
-    agent_action: >
-      Сохранить guard; напомнить admin seal-rotate / auto-promote.
-
-  - scenario: "Пользователь просит встроить SQL proxy в MVP."
-    agent_thought: >
-      MVP — control plane only (решение 1-A). Proxy — отдельный этап и смена контракта.
-    agent_action: >
-      Отказать для MVP; предложить resolve API + app-side routing; при настойчивости — RFC + update spec.
-
-  - scenario: "Пользователь просит rebalance при переполнении."
-    agent_thought: >
-      Модель — append shards в том же period_id (seal + activate), без движения данных.
-    agent_action: >
-      Объяснить sealed→new active; pre-provision standby.
-
-  - scenario: "git push Permission denied (publickey)."
-    agent_thought: >
-      Проект на SSH; не переключаться на HTTPS.
-    agent_action: >
-      Запустить ensure-github-ssh.ps1; при необходимости попросить пользователя
-      загрузить ключ в своём терминале (`2-add-ssh-key.ps1`).
-
-# ==============================================================================
-# 6. ОШИБКИ И ЭСКАЛАЦИЯ
-# ==============================================================================
-error_handling:
-  - "Запрос ломает immutable period / single-active / FSM — указать ограничение и совместимый путь."
-  - "Не уверен в endpoint/env/schema — НЕ ГАДАЙ: прочитай handlers/migrations."
-  - "Гонки seal-rotate и dual-active — приоритет reliability выше косметики."
-  - "GitHub SSH failures — чинить SSH, не HTTPS."
-
-# ==============================================================================
-# 7. ВЕРИФИКАЦИЯ
+# 4. VERIFICATION
 # ==============================================================================
 verification:
-  how_to_run: "cargo test; docker compose -f deploy/docker-compose.yml up -d; integration/smoke из docs"
-  key_scenarios:
-    - domain: "bootstrap immutable"
-      checks:
-        - "повторный bootstrap / смена period_spec → 409"
-    - domain: "period_id"
-      checks:
-        - "time day bucket стабилен в UTC"
-        - "numeric floor(key/width) → p{n}"
-    - domain: "fsm / hot-add"
-      checks:
-        - "register startup_state=active|sealed → reject"
-        - "standby→active→sealed; назад запрещено"
-    - domain: "resolve"
-      checks:
-        - "write → единственный active"
-        - "read → sealed ∪ active, без standby"
-        - "нет active и нет standby → 503"
-    - domain: "seal-rotate"
-      checks:
-        - "stats >= max → seal + promote в одной транзакции"
-        - "два concurrent rotate не создают dual-active"
-    - domain: "agent"
-      checks:
-        - "heartbeat обновляет reported_bytes и last_seen_at"
-    - domain: "metrics"
-      checks:
-        - "GET /metrics отдаёт shardman_* gauges/counters"
-
-# ==============================================================================
-# 8. MAINTENANCE
-# ==============================================================================
-maintenance_rules:
-  - "Агентный SoT: `.ai/master-spec.yaml`; pointer: `.cursor/rules/master-spec.mdc`."
-  - "Человеческий product contract: `docs/master-spec.md`."
-  - "Изменение API / инвариантов / guardrails — обновить YAML + docs/master-spec.md; bump version/last_updated."
-  - "Новый критичный сценарий — добавить в verification.key_scenarios."
-  - "Синхронизируй краткие rules в `.cursor/rules/` при изменении hard rules."
+  unit: "go test ./internal/period/... ./internal/fsm/..."
+  integration: "METADATA_PG_DSN=... go test -tags=integration ./internal/store/..."
+  compose: "make docker-up"
 
 changelog:
+  - version: "0.2.0"
+    date: "2026-08-07"
+    changes:
+      - "Go MVP implemented"
+      - "Time retention ring, max_future_periods, error shard"
   - version: "0.1.0"
     date: "2026-08-06"
     changes:
-      - "Initial agent master-spec for Shardman Rust MVP"
-      - "Invariants: range mode, immutable period, single-active-per-period, FSM, control-plane-only"
-      - "SSH-only GitHub; LBF borrow list for seal/lifecycle/metrics"
+      - "Initial spec (Rust planned, superseded by Go)"
