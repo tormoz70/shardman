@@ -1,0 +1,201 @@
+syntax = "proto3";
+
+package shardman.v1;
+
+option go_package = "github.com/tormoz70/shardman/api/gen/shardman/v1;shardmanv1";
+
+import "google/protobuf/struct.proto";
+
+// --- Resolve ---
+
+service ResolveService {
+  rpc Write(ResolveWriteRequest) returns (ResolveWriteResponse);
+  rpc Read(ResolveReadRequest) returns (ResolveReadResponse);
+  rpc ListBucketShards(ListBucketShardsRequest) returns (ListBucketShardsResponse);
+}
+
+message ResolveWriteRequest {
+  google.protobuf.Value shard_key = 1;
+}
+
+message ResolveWriteResponse {
+  string routing = 1;
+  string bucket_id = 2;
+  string reason = 3;
+  int64 shard_id = 4;
+  string shard_uuid = 5;
+  string endpoint = 6;
+  string state = 7;
+}
+
+message ResolveReadRequest {
+  google.protobuf.Value shard_key = 1;
+}
+
+message ReadShard {
+  int64 shard_id = 1;
+  string shard_uuid = 2;
+  string endpoint = 3;
+  string state = 4;
+}
+
+message ResolveReadResponse {
+  string routing = 1;
+  string bucket_id = 2;
+  string reason = 3;
+  repeated ReadShard shards = 4;
+}
+
+message ListBucketShardsRequest {
+  string bucket_id = 1;
+}
+
+message ListBucketShardsResponse {
+  string bucket_id = 1;
+  repeated Shard shards = 2;
+}
+
+// --- Topology ---
+
+service TopologyService {
+  rpc Get(GetTopologyRequest) returns (Topology);
+  rpc Watch(WatchTopologyRequest) returns (stream TopologyEvent);
+}
+
+message GetTopologyRequest {}
+
+message WatchTopologyRequest {
+  int64 since_version = 1;
+}
+
+message Topology {
+  int64 topology_version = 1;
+  ClusterConfig config = 2;
+  repeated Shard shards = 3;
+}
+
+message TopologyEvent {
+  int64 topology_version = 1;
+  Topology topology = 2;
+}
+
+// --- Admin ---
+
+service AdminService {
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+  rpc RegisterShard(RegisterShardRequest) returns (Shard);
+  rpc SealRotate(SealRotateRequest) returns (SealRotateResponse);
+  rpc PatchShardState(PatchShardStateRequest) returns (PatchShardStateResponse);
+  rpc RetentionTick(RetentionTickRequest) returns (RetentionTickResponse);
+}
+
+message BootstrapRequest {
+  string mode = 1;
+  string bucket_axis = 2;
+  bytes bucket_spec_json = 3;
+  int64 shard_max_bytes = 4;
+  optional int32 retention_depth = 5;
+  optional int32 max_future_buckets = 6;
+}
+
+message BootstrapResponse {
+  string status = 1;
+  int32 min_shards = 2;
+}
+
+message ListShardsRequest {}
+
+message ListShardsResponse {
+  repeated Shard shards = 1;
+}
+
+message RegisterShardRequest {
+  string shard_uuid = 1;
+  string role = 2;
+  string dsn = 3;
+  string advertise_url = 4;
+  string startup_state = 5;
+}
+
+message SealRotateRequest {
+  string bucket_id = 1;
+}
+
+message SealRotateResponse {
+  string status = 1;
+  string bucket_id = 2;
+}
+
+message PatchShardStateRequest {
+  int64 shard_id = 1;
+  string state = 2;
+}
+
+message PatchShardStateResponse {
+  string status = 1;
+}
+
+message RetentionTickRequest {}
+
+message RetentionTickResponse {
+  string status = 1;
+}
+
+// --- Internal ---
+
+service InternalService {
+  rpc ReportStats(ReportStatsRequest) returns (ReportStatsResponse);
+  rpc ReportCleaned(ReportCleanedRequest) returns (ReportCleanedResponse);
+  rpc ReportDrainComplete(ReportDrainCompleteRequest) returns (ReportDrainCompleteResponse);
+}
+
+message ReportStatsRequest {
+  string shard_uuid = 1;
+  int64 reported_bytes = 2;
+}
+
+message ReportStatsResponse {
+  string status = 1;
+  string state = 2;
+}
+
+message ReportCleanedRequest {
+  string shard_uuid = 1;
+}
+
+message ReportCleanedResponse {
+  string status = 1;
+}
+
+message ReportDrainCompleteRequest {
+  string shard_uuid = 1;
+}
+
+message ReportDrainCompleteResponse {
+  string status = 1;
+}
+
+// --- Common ---
+
+message ClusterConfig {
+  string mode = 1;
+  string bucket_axis = 2;
+  bytes bucket_spec_json = 3;
+  int64 shard_max_bytes = 4;
+  optional int32 retention_depth = 5;
+  optional int32 max_future_buckets = 6;
+}
+
+message Shard {
+  int64 id = 1;
+  string shard_uuid = 2;
+  string role = 3;
+  string bucket_id = 4;
+  string state = 5;
+  string dsn = 6;
+  string advertise_url = 7;
+  int64 reported_bytes = 8;
+  int64 max_bytes = 9;
+  int64 version = 10;
+}

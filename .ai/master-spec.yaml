@@ -2,19 +2,20 @@
 # META
 # ==============================================================================
 agent_name: "Shardman_ControlPlane_Agent"
-version: "0.3.0"
+version: "0.4.0"
 target_repository: "git@github.com:tormoz70/shardman.git"
-last_updated: "2026-08-10"
+last_updated: "2026-08-11"
 purpose: >
   Помощь в разработке shardman — Go control plane для range/hash-шардирования PostgreSQL.
   Инварианты: immutable bootstrap, bucket_id routing, volume subshards, time retention ring,
-  max_future_buckets, error shard, resolve API, seal/retention supervisors.
+  max_future_buckets, error shard, gRPC resolve/topology API, seal/retention supervisors, drain FSM.
 
 related_context:
   - "docs/master-spec.md"
   - "docs/mvp-plan.md"
   - "docs/sharding-model.md"
   - "docs/architecture.md"
+  - "docs/runbook-alerts.md"
   - ".cursor/rules/master-spec.mdc"
 
 # ==============================================================================
@@ -30,22 +31,39 @@ persona: >
 domain_knowledge:
   stack:
     - "Go 1.22+"
-    - "HTTP: chi (/v1/...)"
-    - "Metadata: PostgreSQL (pgx/v5), migrations/"
-    - "cmd/server, cmd/agent, cmd/shardman"
-    - "Prometheus /metrics, slog"
+    - "gRPC + protobuf (api/proto/shardman/v1)"
+    - "HTTP ops only: /healthz, /metrics"
+    - "Metadata: PostgreSQL via PgBouncer (pgx/v5), migrations/"
+    - "cmd/server, cmd/agent, cmd/shardman, pkg/client"
+    - "Prometheus /metrics, optional OTel OTLP, slog"
     - "deploy/docker-compose.yml"
     - "GitHub: SSH only"
 
   layout:
+    - "api/proto — protobuf services"
+    - "internal/grpcapi — gRPC handlers"
     - "internal/bucket — bucket_id, ClassifyWrite, retention, hash"
-    - "internal/fsm — standby/active/sealed/cleaning, data/error roles"
+    - "internal/fsm — standby/active/draining/sealed/cleaning, data/error roles"
     - "internal/store — metadata repository"
     - "internal/resolve — write/read routing"
-    - "internal/seal — volume supervisor"
+    - "internal/seal — volume supervisor + drain"
     - "internal/retention — time eviction supervisor"
-    - "internal/api — HTTP handlers"
+    - "internal/topology — version broadcast for Watch"
     - "internal/metrics — Prometheus"
+    - "pkg/client — Go SDK with topology cache"
+
+  api:
+    transport: gRPC
+    public_services: ["ResolveService", "TopologyService"]
+    protected_services: ["AdminService", "InternalService"]
+    auth_metadata: "x-cluster-key"
+    topology:
+      get: "Topology.Get — snapshot + topology_version"
+      watch: "Topology.Watch — stream on version bump"
+    status_codes:
+      unavailable: "no active / standby exhausted"
+      already_exists: "second bootstrap"
+      unauthenticated: "bad cluster key"
 
   sharding:
     nesting: "shard_key → bucket_id → volume subshards"
@@ -57,10 +75,10 @@ domain_knowledge:
         bucket_count: "immutable at bootstrap"
         hash_algo: "xxhash64"
         no_retention_error_required: true
-    volume_subshards: "standby→active→sealed per bucket_id; one active per bucket"
+    volume_subshards: "standby→active→draining→sealed per bucket_id; one active per bucket"
     time_retention:
       min_shards: "retention_depth + 1 + max_future_buckets + 1(error)"
-      eviction: "all data subshards of bucket → cleaning → agent truncate → standby"
+      eviction: "sealed data subshards of bucket → cleaning → agent truncate → standby"
       wall_clock: "retention anchored to wall-clock, not max written bucket"
     max_future_buckets:
       zero: "future timestamps → error shard (not normal buckets)"
@@ -72,31 +90,39 @@ domain_knowledge:
       no_retention_clean: true
     numeric_mvp: "volume subshards only; no retention/error required"
     hash_mvp: "fixed bucket_count; volume seal; no rebalance; no generations in MVP"
+    client_routing:
+      cache_topology: true
+      resolve_on_miss_only: true
+      invalidate_on: ["topology_version bump", "Unavailable", "sealed write error"]
 
   guardrails:
-    - "Bootstrap immutable; second bootstrap → 409"
+    - "Bootstrap immutable; second bootstrap → AlreadyExists"
     - "Hot-add data shards only as standby"
     - "Only one error shard"
     - "No SQL proxy in MVP"
-    - "CLUSTER_KEY on admin/internal"
+    - "CLUSTER_KEY on admin/internal gRPC metadata"
     - "No rebalance / bucket_spec change / bucket_count change"
+    - "Metadata HA via PgBouncer + external PG cluster (no in-app failover)"
 
 # ==============================================================================
 # 3. CODE ANCHORS
 # ==============================================================================
 code_anchors:
+  proto: "api/proto/shardman/v1/shardman.proto"
+  grpcapi: "internal/grpcapi/server.go"
   bucket: "internal/bucket/bucket.go"
   routing: "internal/bucket/routing.go"
   fsm: "internal/fsm/fsm.go"
   store: "internal/store/store.go"
   resolve: "internal/resolve/resolve.go"
-  api: "internal/api/server.go"
   seal: "internal/seal/seal.go"
   retention: "internal/retention/retention.go"
+  topology: "internal/topology/broadcast.go"
+  client: "pkg/client/client.go"
   server: "cmd/server/main.go"
   agent: "cmd/agent/main.go"
   cli: "cmd/shardman/main.go"
-  migrations: "migrations/001_init.sql"
+  migrations: "internal/store/migrations/"
 
 # ==============================================================================
 # 4. VERIFICATION
@@ -104,9 +130,19 @@ code_anchors:
 verification:
   unit: "go test ./internal/bucket/... ./internal/fsm/..."
   integration: "METADATA_PG_DSN=... go test -tags=integration ./internal/integration/..."
-  compose: "make docker-up"
+  e2e: "go test -tags=e2e ./internal/e2e/...  # Docker + testcontainers"
+  compose: "docker compose -f deploy/docker-compose.yml up  # gRPC :9091, metrics :8080"
 
 changelog:
+  - version: "0.4.0"
+    date: "2026-08-11"
+    changes:
+      - "REST/chi replaced with gRPC + protobuf"
+      - "Topology.Get/Watch with topology_version"
+      - "Drain FSM: active→draining→sealed; agent revoke on drain"
+      - "Retention: only sealed→cleaning"
+      - "pkg/client SDK, OTel optional, testcontainers e2e"
+      - "Agent SIZE_SOURCE=database|relations"
   - version: "0.3.0"
     date: "2026-08-10"
     changes:

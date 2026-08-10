@@ -1,17 +1,26 @@
-.PHONY: build test test-integration test-stand docker-up docker-down
+.PHONY: build test test-integration test-e2e test-stand docker-up docker-down proto
+
+GO ?= go
+PROTOC ?= tools/protoc/bin/protoc.exe
 
 build:
-	go build -o bin/server ./cmd/server
-	go build -o bin/agent ./cmd/agent
-	go build -o bin/shardman ./cmd/shardman
+	$(GO) build -o bin/server ./cmd/server
+	$(GO) build -o bin/agent ./cmd/agent
+	$(GO) build -o bin/shardman ./cmd/shardman
+
+proto:
+	powershell -File scripts/generate-proto.ps1
 
 test:
-	go test ./...
+	$(GO) test ./...
 
 METADATA_PG_DSN ?= postgres://shardman:shardman@127.0.0.1:5433/shardman_meta?sslmode=disable
 
 test-integration:
-	METADATA_PG_DSN=$(METADATA_PG_DSN) go test -tags=integration ./internal/integration/... -count=1 -v
+	METADATA_PG_DSN=$(METADATA_PG_DSN) $(GO) test -tags=integration ./internal/integration/... -count=1 -v
+
+test-e2e:
+	$(GO) test -tags=e2e ./internal/e2e/... -count=1 -v -timeout=10m
 
 test-stand: docker-up
 	@$(MAKE) test-integration

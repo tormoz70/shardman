@@ -3,141 +3,120 @@
 package integration
 
 import (
-	"bytes"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"context"
 	"testing"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
-	"github.com/tormoz70/shardman/internal/api"
+	shardmanv1 "github.com/tormoz70/shardman/api/gen/shardman/v1"
 	"github.com/tormoz70/shardman/internal/bucket"
 	"github.com/tormoz70/shardman/internal/fsm"
-	"github.com/tormoz70/shardman/internal/resolve"
+	"github.com/tormoz70/shardman/internal/grpcapi"
+	"github.com/tormoz70/shardman/internal/topology"
 )
 
-func newAPIServer(e *Env) *api.Server {
-	return &api.Server{
+func newGRPCServer(e *Env) *grpcapi.Server {
+	return &grpcapi.Server{
 		Store:      e.Store,
 		ClusterKey: clusterKey,
 		Resolver:   e.Resolver,
 		RetSup:     e.Retention,
+		Broadcast:  topology.NewBroadcast(),
 	}
+}
+
+func adminCtx(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, "x-cluster-key", clusterKey)
 }
 
 func TestAPIBootstrapAnd409(t *testing.T) {
 	e := OpenEnv(t)
 	defer e.Close()
+	srv := newGRPCServer(e)
+	_, admin := dialClients(t, srv)
+	ctx := adminCtx(context.Background())
 
-	srv := newAPIServer(e)
-	body, _ := json.Marshal(map[string]any{
-		"mode":            "hash",
-		"bucket_axis":     "hash",
-		"bucket_spec":     map[string]any{"bucket_count": 8, "hash_algo": "xxhash64"},
-		"shard_max_bytes": 1024,
-	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/admin/bootstrap", bytes.NewReader(body))
-	req.Header.Set("X-Cluster-Key", clusterKey)
-	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, req)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("bootstrap status %d: %s", w.Code, w.Body.String())
+	req := &shardmanv1.BootstrapRequest{
+		Mode:           "hash",
+		BucketAxis:     "hash",
+		BucketSpecJson: []byte(`{"bucket_count":8,"hash_algo":"xxhash64"}`),
+		ShardMaxBytes:  1024,
 	}
-
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/admin/bootstrap", bytes.NewReader(body))
-	req2.Header.Set("X-Cluster-Key", clusterKey)
-	w2 := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w2, req2)
-	if w2.Code != http.StatusConflict {
-		t.Fatalf("second bootstrap status %d", w2.Code)
+	if _, err := admin.Bootstrap(ctx, req); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if _, err := admin.Bootstrap(ctx, req); status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("expected AlreadyExists, got %v", err)
 	}
 }
 
 func TestAPIUnauthorizedBootstrap(t *testing.T) {
 	e := OpenEnv(t)
 	defer e.Close()
+	srv := newGRPCServer(e)
+	_, admin := dialClients(t, srv)
 
-	srv := newAPIServer(e)
-	body, _ := json.Marshal(map[string]any{
-		"mode":            "range",
-		"bucket_axis":     "numeric",
-		"bucket_spec":     map[string]int64{"width": 1000},
-		"shard_max_bytes": 1024,
+	_, err := admin.Bootstrap(context.Background(), &shardmanv1.BootstrapRequest{
+		Mode:           "range",
+		BucketAxis:     "numeric",
+		BucketSpecJson: []byte(`{"width":1000}`),
+		ShardMaxBytes:  1024,
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/admin/bootstrap", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("status %d", w.Code)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("status %v", err)
 	}
 }
 
 func TestAPIResolveWrite503(t *testing.T) {
 	e := OpenEnv(t)
 	defer e.Close()
-
 	e.BootstrapNumeric(1000, 1024)
-	srv := newAPIServer(e)
+	srv := newGRPCServer(e)
+	resolveClient, _ := dialClients(t, srv)
 
-	body, _ := json.Marshal(map[string]int{"shard_key": 500})
-	req := httptest.NewRequest(http.MethodPost, "/v1/resolve/write", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, req)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	v, err := structpbNew(500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolveClient.Write(context.Background(), &shardmanv1.ResolveWriteRequest{ShardKey: v})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("status %v", err)
 	}
 }
 
 func TestAPIResolveWriteAndSealRotate(t *testing.T) {
 	e := OpenEnv(t)
 	defer e.Close()
-
 	maxBytes := int64(100)
 	e.BootstrapNumeric(1000, maxBytes)
 	e.RegisterStandbys(2)
-	srv := newAPIServer(e)
+	srv := newGRPCServer(e)
+	resolveClient, admin := dialClients(t, srv)
 
-	writeBody, _ := json.Marshal(map[string]int{"shard_key": 500})
-	req := httptest.NewRequest(http.MethodPost, "/v1/resolve/write", bytes.NewReader(writeBody))
-	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("resolve %d: %s", w.Code, w.Body.String())
-	}
-	var wr resolve.WriteResult
-	if err := json.Unmarshal(w.Body.Bytes(), &wr); err != nil {
+	v, _ := structpbNew(500)
+	wr, err := resolveClient.Write(context.Background(), &shardmanv1.ResolveWriteRequest{ShardKey: v})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if wr.BucketID != "n0" || wr.Routing != bucket.RouteBucket {
+	if wr.GetBucketId() != "n0" || wr.GetRouting() != string(bucket.RouteBucket) {
 		t.Fatalf("write %+v", wr)
 	}
 
 	if err := e.Store.UpdateStats(e.Ctx, e.ActiveUUID("n0"), maxBytes); err != nil {
 		t.Fatal(err)
 	}
-
-	sealBody, _ := json.Marshal(map[string]string{"bucket_id": "n0"})
-	sealReq := httptest.NewRequest(http.MethodPost, "/v1/admin/seal-rotate", bytes.NewReader(sealBody))
-	sealReq.Header.Set("X-Cluster-Key", clusterKey)
-	sealW := httptest.NewRecorder()
-	srv.Router().ServeHTTP(sealW, sealReq)
-	if sealW.Code != http.StatusOK {
-		t.Fatalf("seal %d: %s", sealW.Code, sealW.Body.String())
-	}
-
-	readBody, _ := json.Marshal(map[string]int{"shard_key": 500})
-	readReq := httptest.NewRequest(http.MethodPost, "/v1/resolve/read", bytes.NewReader(readBody))
-	readW := httptest.NewRecorder()
-	srv.Router().ServeHTTP(readW, readReq)
-	if readW.Code != http.StatusOK {
-		t.Fatalf("read %d", readW.Code)
-	}
-	var rr resolve.ReadResult
-	if err := json.Unmarshal(readW.Body.Bytes(), &rr); err != nil {
+	if _, err := admin.SealRotate(adminCtx(e.Ctx), &shardmanv1.SealRotateRequest{BucketId: "n0"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(rr.Shards) != 2 {
+
+	rr, err := resolveClient.Read(context.Background(), &shardmanv1.ResolveReadRequest{ShardKey: v})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rr.GetShards()) != 2 {
 		t.Fatalf("read shards %+v", rr)
 	}
 }
@@ -145,25 +124,20 @@ func TestAPIResolveWriteAndSealRotate(t *testing.T) {
 func TestAPIRegisterShard(t *testing.T) {
 	e := OpenEnv(t)
 	defer e.Close()
-
 	e.BootstrapNumeric(1000, 1024)
-	srv := newAPIServer(e)
+	srv := newGRPCServer(e)
+	_, admin := dialClients(t, srv)
 
 	u := uuid.New()
-	body, _ := json.Marshal(map[string]string{
-		"shard_uuid":    u.String(),
-		"dsn":           "postgres://api/db",
-		"role":          "data",
-		"startup_state": "standby",
+	_, err := admin.RegisterShard(adminCtx(e.Ctx), &shardmanv1.RegisterShardRequest{
+		ShardUuid:    u.String(),
+		Dsn:          "postgres://api/db",
+		Role:         "data",
+		StartupState: "standby",
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/admin/shards", bytes.NewReader(body))
-	req.Header.Set("X-Cluster-Key", clusterKey)
-	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, req)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("register %d: %s", w.Code, w.Body.String())
+	if err != nil {
+		t.Fatal(err)
 	}
-
 	sh, err := e.Store.GetShardByUUID(e.Ctx, u)
 	if err != nil {
 		t.Fatal(err)
@@ -176,26 +150,62 @@ func TestAPIRegisterShard(t *testing.T) {
 func TestAPIBucketShardsList(t *testing.T) {
 	e := OpenEnv(t)
 	defer e.Close()
-
 	e.BootstrapNumeric(1000, 1024)
 	e.RegisterStandbys(1)
 	_, err := e.Resolver.ResolveWrite(e.Ctx, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := newAPIServer(e)
+	srv := newGRPCServer(e)
+	resolveClient, _ := dialClients(t, srv)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/buckets/n0/shards", nil)
-	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("list %d", w.Code)
-	}
-	var resp map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+	resp, err := resolveClient.ListBucketShards(context.Background(), &shardmanv1.ListBucketShardsRequest{BucketId: "n0"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if resp["bucket_id"] != "n0" {
+	if resp.GetBucketId() != "n0" || len(resp.GetShards()) == 0 {
 		t.Fatalf("resp %+v", resp)
+	}
+}
+
+func TestTopologyVersionBump(t *testing.T) {
+	e := OpenEnv(t)
+	defer e.Close()
+	e.BootstrapNumeric(1000, 1024)
+	srv := newGRPCServer(e)
+	topoClient := dialTopology(t, srv)
+
+	before, err := topoClient.Get(context.Background(), &shardmanv1.GetTopologyRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RegisterStandbys(1)
+	after, err := topoClient.Get(context.Background(), &shardmanv1.GetTopologyRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.TopologyVersion <= before.TopologyVersion {
+		t.Fatalf("version before=%d after=%d", before.TopologyVersion, after.TopologyVersion)
+	}
+}
+
+func TestRetentionSkipsActiveBucket(t *testing.T) {
+	e := OpenEnv(t)
+	defer e.Close()
+	e.BootstrapTime(1, 0, 1024)
+	e.RegisterError()
+	e.RegisterStandbys(5)
+
+	wr, err := e.Resolver.ResolveWrite(e.Ctx, "2026-05-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Retention.Tick(e.Ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, sh := range e.ShardsInBucket(wr.BucketID) {
+		if sh.State == fsm.StateCleaning {
+			t.Fatalf("active bucket cleaned: %+v", sh)
+		}
 	}
 }

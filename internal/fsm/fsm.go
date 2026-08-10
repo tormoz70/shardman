@@ -7,6 +7,7 @@ type State string
 const (
 	StateStandby  State = "standby"
 	StateActive   State = "active"
+	StateDraining State = "draining"
 	StateSealed   State = "sealed"
 	StateCleaning State = "cleaning"
 )
@@ -20,7 +21,8 @@ const (
 
 var dataTransitions = map[State]map[State]bool{
 	StateStandby:  {StateActive: true},
-	StateActive:   {StateSealed: true},
+	StateActive:   {StateDraining: true, StateSealed: true},
+	StateDraining: {StateSealed: true},
 	StateSealed:   {StateCleaning: true},
 	StateCleaning: {StateStandby: true},
 }

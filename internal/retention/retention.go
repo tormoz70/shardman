@@ -61,6 +61,15 @@ func (s *Supervisor) tick(ctx context.Context) error {
 		return err
 	}
 	for _, pid := range evict {
+		active, err := s.Store.HasActiveInBucket(ctx, pid)
+		if err != nil {
+			s.Log.Warn("retention active check", "bucket", pid, "err", err)
+			continue
+		}
+		if active {
+			s.Log.Info("retention skip active bucket", "bucket", pid)
+			continue
+		}
 		n, err := s.Store.MarkBucketCleaning(ctx, pid)
 		if err != nil {
 			s.Log.Warn("retention mark cleaning", "bucket", pid, "err", err)

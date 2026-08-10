@@ -1,19 +1,19 @@
 # Shardman Go MVP
 
-> Overview: control plane на Go для range/hash-шардирования Postgres: metadata-БД, HTTP resolve, `bucket_id`, volume-subshards, time retention-кольцо, `max_future_buckets`, error-шард, Prometheus.
+> Control plane на Go для range/hash-шардирования Postgres: metadata (PgBouncer), **gRPC**, `bucket_id`, volume-subshards, drain FSM, time retention, error-шард, Prometheus/OTel.
 
-**Стек:** Go 1.22+. SQL proxy — out of MVP.
+**Стек:** Go 1.22+, gRPC/protobuf. SQL proxy — out of MVP.
 
-**Live contract:** [master-spec.md](master-spec.md) / [`.ai/master-spec.yaml`](../.ai/master-spec.yaml). Этот файл — краткий обзор MVP.
+**Live contract:** [master-spec.md](master-spec.md) / [`.ai/master-spec.yaml`](../.ai/master-spec.yaml).
 
-## Status
+## Status (v0.4.0)
 
-- [x] `internal/bucket` + `internal/fsm` (time/numeric/hash, retention, error)
-- [x] Migrations + chi bootstrap/resolve/`CLUSTER_KEY`
-- [x] Volume seal + retention clean + error routing
-- [x] `cmd/agent` + `cmd/shardman`
-- [x] Prometheus + compose + unit tests
-- [x] Integration suite `internal/integration` (time, numeric, hash, API)
+- [x] `internal/bucket` + `internal/fsm` (time/numeric/hash, draining)
+- [x] gRPC: Resolve, Topology (Get/Watch), Admin, Internal
+- [x] Volume seal + **drain** + retention (sealed→cleaning only)
+- [x] `cmd/agent` (`SIZE_SOURCE`), `cmd/shardman`, `pkg/client`
+- [x] Prometheus metrics + optional OTel + alert runbook
+- [x] Tests: unit, integration (`METADATA_PG_DSN`), e2e (testcontainers)
 
 ## Scope
 
@@ -21,7 +21,7 @@
 - Modes: `range` (time|numeric) | `hash` (fixed `bucket_count`, xxhash64)
 - One active per `bucket_id`; seal-rotate без ребаланса
 - Time: retention + `max_future_buckets` + one error shard
-- Hash generations — out of MVP
+- Topology `Get` + `Watch` для client-side route cache
 
 ## Out of MVP
 
@@ -29,7 +29,19 @@
 - error-shard volume rotation / multi-error
 - retention для numeric/hash
 - in-place `bucket_count` change / consistent-hash rebalance
-- HA, gRPC
+- mTLS / JWT (auth = `CLUSTER_KEY` в gRPC metadata)
+
+## Post-MVP backlog
+
+- filesystem-based shard sizing (`Statfs` на PVC агента)
+
+## Quick commands
+
+```bash
+make docker-up          # gRPC :9091, metrics :8080
+make test-integration
+make test-e2e           # Docker + testcontainers
+```
 
 ## Git / GitHub
 

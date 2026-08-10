@@ -8,19 +8,23 @@ import (
 )
 
 type Config struct {
+	GRPCAddr          string
 	HTTPAddr          string
 	MetadataDSN       string
 	ClusterKey        string
 	SealCheckInterval time.Duration
+	DrainTimeout      time.Duration
 	AgentReachTTL     time.Duration
 }
 
 func LoadServer() (Config, error) {
 	c := Config{
+		GRPCAddr:          getenv("GRPC_ADDR", ":9090"),
 		HTTPAddr:          getenv("HTTP_ADDR", ":8080"),
 		MetadataDSN:       os.Getenv("METADATA_PG_DSN"),
 		ClusterKey:        os.Getenv("CLUSTER_KEY"),
 		SealCheckInterval: durationEnv("SEAL_CHECK_INTERVAL", 30*time.Second),
+		DrainTimeout:      durationEnv("DRAIN_TIMEOUT", 30*time.Second),
 		AgentReachTTL:     durationEnv("AGENT_REACH_TTL", 2*time.Minute),
 	}
 	if c.MetadataDSN == "" {
@@ -32,21 +36,30 @@ func LoadServer() (Config, error) {
 type AgentConfig struct {
 	PGDSN          string
 	ShardUUID      string
-	CoordinatorURL string
+	CoordinatorAddr string
 	ClusterKey     string
 	StatsInterval  time.Duration
+	SizeSource     string
+	AppDBRole      string
+	DrainMode      string
 }
 
 func LoadAgent() (AgentConfig, error) {
 	c := AgentConfig{
-		PGDSN:          os.Getenv("PG_DSN"),
-		ShardUUID:      os.Getenv("SHARD_UUID"),
-		CoordinatorURL: os.Getenv("COORDINATOR_URL"),
-		ClusterKey:     os.Getenv("CLUSTER_KEY"),
-		StatsInterval:  durationEnv("STATS_INTERVAL", 15*time.Second),
+		PGDSN:           os.Getenv("PG_DSN"),
+		ShardUUID:       os.Getenv("SHARD_UUID"),
+		CoordinatorAddr: getenv("COORDINATOR_ADDR", os.Getenv("COORDINATOR_URL")),
+		ClusterKey:      os.Getenv("CLUSTER_KEY"),
+		StatsInterval:   durationEnv("STATS_INTERVAL", 15*time.Second),
+		SizeSource:      getenv("SIZE_SOURCE", "database"),
+		AppDBRole:       os.Getenv("APP_DB_ROLE"),
+		DrainMode:       getenv("DRAIN_MODE", "revoke"),
 	}
-	if c.PGDSN == "" || c.ShardUUID == "" || c.CoordinatorURL == "" {
-		return c, fmt.Errorf("PG_DSN, SHARD_UUID, COORDINATOR_URL required")
+	if c.PGDSN == "" || c.ShardUUID == "" || c.CoordinatorAddr == "" {
+		return c, fmt.Errorf("PG_DSN, SHARD_UUID, COORDINATOR_ADDR required")
+	}
+	if c.SizeSource != "database" && c.SizeSource != "relations" {
+		return c, fmt.Errorf("SIZE_SOURCE must be database or relations")
 	}
 	return c, nil
 }

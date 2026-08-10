@@ -1,21 +1,23 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
+	shardmanv1 "github.com/tormoz70/shardman/api/gen/shardman/v1"
 	"github.com/tormoz70/shardman/internal/config"
 	"github.com/tormoz70/shardman/internal/fsm"
+	"github.com/tormoz70/shardman/internal/oteltrace"
 )
 
 func main() {
@@ -29,10 +31,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	_, _, dialOpts, err := oteltrace.Setup(ctx)
+	if err != nil {
+		slog.Error("otel", "err", err)
+		os.Exit(1)
+	}
+	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	conn, err := grpc.NewClient(cfg.CoordinatorAddr, dialOpts...)
+	if err != nil {
+		slog.Error("grpc dial", "err", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+	client := shardmanv1.NewInternalServiceClient(conn)
+
 	ticker := time.NewTicker(cfg.StatsInterval)
 	defer ticker.Stop()
 
-	if err := tick(ctx, cfg); err != nil {
+	if err := tick(ctx, cfg, client); err != nil {
 		slog.Warn("tick", "err", err)
 	}
 
@@ -41,64 +58,86 @@ func main() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := tick(ctx, cfg); err != nil {
+			if err := tick(ctx, cfg, client); err != nil {
 				slog.Warn("tick", "err", err)
 			}
 		}
 	}
 }
 
-func tick(ctx context.Context, cfg config.AgentConfig) error {
-	conn, err := pgx.Connect(ctx, cfg.PGDSN)
+func tick(ctx context.Context, cfg config.AgentConfig, client shardmanv1.InternalServiceClient) error {
+	pgConn, err := pgx.Connect(ctx, cfg.PGDSN)
 	if err != nil {
 		return err
 	}
-	defer conn.Close(ctx)
+	defer pgConn.Close(ctx)
 
-	var size int64
-	if err := conn.QueryRow(ctx, `SELECT pg_database_size(current_database())`).Scan(&size); err != nil {
-		return err
-	}
-
-	state, err := postStats(ctx, cfg, size)
+	size, err := measureSize(ctx, pgConn, cfg.SizeSource)
 	if err != nil {
 		return err
 	}
-	if state == string(fsm.StateCleaning) {
-		if err := cleanDatabase(ctx, conn); err != nil {
+
+	rpcCtx := ctx
+	if cfg.ClusterKey != "" {
+		rpcCtx = metadata.AppendToOutgoingContext(ctx, "x-cluster-key", cfg.ClusterKey)
+	}
+	resp, err := client.ReportStats(rpcCtx, &shardmanv1.ReportStatsRequest{
+		ShardUuid:     cfg.ShardUUID,
+		ReportedBytes: size,
+	})
+	if err != nil {
+		return err
+	}
+
+	switch resp.GetState() {
+	case string(fsm.StateDraining):
+		if err := drainShard(ctx, pgConn, cfg); err != nil {
 			return err
 		}
-		return postCleaned(ctx, cfg)
+		_, err = client.ReportDrainComplete(rpcCtx, &shardmanv1.ReportDrainCompleteRequest{ShardUuid: cfg.ShardUUID})
+		return err
+	case string(fsm.StateCleaning):
+		if err := cleanDatabase(ctx, pgConn); err != nil {
+			return err
+		}
+		_, err = client.ReportCleaned(rpcCtx, &shardmanv1.ReportCleanedRequest{ShardUuid: cfg.ShardUUID})
+		if err == nil {
+			slog.Info("shard cleaned and recycled")
+		}
+		return err
 	}
 	return nil
 }
 
-func postStats(ctx context.Context, cfg config.AgentConfig, size int64) (string, error) {
-	body, _ := json.Marshal(map[string]any{
-		"shard_uuid":     cfg.ShardUUID,
-		"reported_bytes": size,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.CoordinatorURL+"/v1/internal/stats", bytes.NewReader(body))
-	if err != nil {
-		return "", err
+func measureSize(ctx context.Context, conn *pgx.Conn, source string) (int64, error) {
+	var size int64
+	if source == "relations" {
+		err := conn.QueryRow(ctx, `
+			SELECT COALESCE(SUM(pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(tablename))), 0)::bigint
+			FROM pg_tables WHERE schemaname = 'public'`).Scan(&size)
+		return size, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if cfg.ClusterKey != "" {
-		req.Header.Set("X-Cluster-Key", cfg.ClusterKey)
+	err := conn.QueryRow(ctx, `SELECT pg_database_size(current_database())`).Scan(&size)
+	return size, err
+}
+
+func drainShard(ctx context.Context, conn *pgx.Conn, cfg config.AgentConfig) error {
+	if cfg.DrainMode == "terminate" {
+		_, err := conn.Exec(ctx, `
+			SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+			WHERE datname = current_database() AND pid <> pg_backend_pid()`)
+		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
+	if cfg.AppDBRole != "" {
+		_, err := conn.Exec(ctx, fmt.Sprintf(`REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM %s`, quoteIdent(cfg.AppDBRole)))
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("stats status %d", resp.StatusCode)
-	}
-	var out struct {
-		State string `json:"state"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return out.State, nil
+	slog.Info("drain: no APP_DB_ROLE; skipping revoke")
+	return nil
+}
+
+func quoteIdent(s string) string {
+	return `"` + s + `"`
 }
 
 func cleanDatabase(ctx context.Context, conn *pgx.Conn) error {
@@ -109,24 +148,4 @@ func cleanDatabase(ctx context.Context, conn *pgx.Conn) error {
 			END LOOP;
 		END $$;`)
 	return err
-}
-
-func postCleaned(ctx context.Context, cfg config.AgentConfig) error {
-	body, _ := json.Marshal(map[string]string{"shard_uuid": cfg.ShardUUID})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.CoordinatorURL+"/v1/internal/cleaned", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Cluster-Key", cfg.ClusterKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("cleaned status %d", resp.StatusCode)
-	}
-	slog.Info("shard cleaned and recycled")
-	return nil
 }

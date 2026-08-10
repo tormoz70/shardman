@@ -5,14 +5,14 @@ alwaysApply: true
 
 # Shardman invariants
 
-- **Control plane only:** resolve topology via HTTP; apps talk to Postgres directly.
+- **Control plane only:** resolve topology via **gRPC**; apps talk to Postgres directly.
 - **Modes:** `range` (`bucket_axis` time|numeric) or `hash` (`bucket_axis=hash`); chosen at bootstrap; never change live.
-- **No rebalance:** full shard → `sealed`; next `standby` → `active` for the same `bucket_id`. Hash: never change `bucket_count`.
+- **No rebalance:** full shard → seal path (`draining` → `sealed`); next `standby` → `active` for the same `bucket_id`. Hash: never change `bucket_count`.
 - **Single active per bucket:** enforce with DB partial unique index + transactional seal-rotate.
-- **FSM:** only `standby → active → sealed`. Reject register as `active`/`sealed`.
-- **Write path:** `shard_key → bucket_id → active`. Missing active → auto-promote or `503`.
+- **FSM:** `standby → active → draining → sealed → cleaning → standby` (data). Reject register as `active`/`sealed`.
+- **Write path:** `shard_key → bucket_id → active`. Missing active → auto-promote or gRPC `Unavailable`.
 - **Read path:** return `sealed ∪ active` for the bucket; never `standby`.
-- **Time retention:** `retention_depth`, pool `depth+1+max_future_buckets+1(error)`; evicted buckets cleaned and recycled.
+- **Time retention:** `retention_depth`, pool `depth+1+max_future_buckets+1(error)`; only **sealed** shards of evicted buckets → cleaning.
 - **`max_future_buckets`:** 0 → future data goes to error shard; N → allow N future time buckets.
 - **Error shard:** one `role=error`, quarantine for out-of-model writes; never retention-cleaned.
 

@@ -1,17 +1,20 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	shardmanv1 "github.com/tormoz70/shardman/api/gen/shardman/v1"
+	"github.com/tormoz70/shardman/pkg/client"
 )
 
 func main() {
-	base := flag.String("url", getenv("SHARDMAN_URL", "http://localhost:8080"), "shardman server URL")
+	addr := flag.String("addr", getenv("SHARDMAN_ADDR", "localhost:9090"), "shardman gRPC address")
 	key := flag.String("key", os.Getenv("CLUSTER_KEY"), "cluster key")
 	flag.Parse()
 
@@ -20,19 +23,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := context.Background()
+	c, err := client.Dial(ctx, *addr, client.Options{ClusterKey: *key})
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	defer c.Close()
+
 	switch flag.Arg(0) {
 	case "bootstrap":
-		runBootstrap(*base, *key, flag.Args()[1:])
+		runBootstrap(ctx, c, flag.Args()[1:])
 	case "shards":
-		runShards(*base, *key)
+		runShards(ctx, c)
 	case "register":
-		runRegister(*base, *key, flag.Args()[1:])
+		runRegister(ctx, c, flag.Args()[1:])
 	case "resolve-write":
-		runResolve(*base, "/v1/resolve/write", flag.Args()[1:])
+		runResolveWrite(ctx, c, flag.Args()[1:])
 	case "resolve-read":
-		runResolve(*base, "/v1/resolve/read", flag.Args()[1:])
+		runResolveRead(ctx, c, flag.Args()[1:])
 	case "seal-rotate":
-		runSealRotate(*base, *key, flag.Args()[1:])
+		runSealRotate(ctx, c, flag.Args()[1:])
+	case "topology":
+		runTopology(ctx, c)
 	default:
 		printUsage()
 		os.Exit(1)
@@ -44,6 +57,7 @@ func printUsage() {
   shardman bootstrap --axis time --unit month --retention 3 --future 1 --max-bytes 1073741824
   shardman bootstrap --axis hash --buckets 256 --max-bytes 1073741824
   shardman shards
+  shardman topology
   shardman register --uuid <uuid> --dsn <dsn> [--role error|data] [--url advertise]
   shardman resolve-write --key "2026-08-06T00:00:00Z"
   shardman resolve-read --key "2026-08-06T00:00:00Z"
@@ -51,7 +65,7 @@ func printUsage() {
 `)
 }
 
-func runBootstrap(base, key string, args []string) {
+func runBootstrap(ctx context.Context, c *client.Client, args []string) {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 	axis := fs.String("axis", "time", "bucket axis: time|numeric|hash")
 	unit := fs.String("unit", "month", "time unit")
@@ -63,103 +77,103 @@ func runBootstrap(base, key string, args []string) {
 	_ = fs.Parse(args)
 
 	mode := "range"
-	var spec json.RawMessage
+	var spec any
 	switch *axis {
 	case "numeric":
-		spec, _ = json.Marshal(map[string]int64{"width": *width})
+		spec = map[string]int64{"width": *width}
 	case "hash":
 		mode = "hash"
-		spec, _ = json.Marshal(map[string]any{"bucket_count": *buckets, "hash_algo": "xxhash64"})
+		spec = map[string]any{"bucket_count": *buckets, "hash_algo": "xxhash64"}
 	default:
-		spec, _ = json.Marshal(map[string]string{"unit": *unit})
+		spec = map[string]string{"unit": *unit}
 	}
-	bodyMap := map[string]any{
-		"mode":            mode,
-		"bucket_axis":     *axis,
-		"bucket_spec":     spec,
-		"shard_max_bytes": *maxBytes,
-		"cluster_key":     key,
+	req := &shardmanv1.BootstrapRequest{
+		Mode:           mode,
+		BucketAxis:     *axis,
+		BucketSpecJson: client.JSONSpec(spec),
+		ShardMaxBytes:  *maxBytes,
 	}
 	if *axis == "time" {
-		bodyMap["retention_depth"] = *retention
-		bodyMap["max_future_buckets"] = *future
+		rd := int32(*retention)
+		mf := int32(*future)
+		req.RetentionDepth = &rd
+		req.MaxFutureBuckets = &mf
 	}
-	body, _ := json.Marshal(bodyMap)
-	doPOST(base+"/v1/admin/bootstrap", key, body)
+	resp, err := c.Bootstrap(ctx, req)
+	printResult(resp, err)
 }
 
-func runShards(base, key string) {
-	doGET(base+"/v1/admin/shards", key)
+func runShards(ctx context.Context, c *client.Client) {
+	topo, err := c.GetTopology(ctx)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	enc, _ := json.MarshalIndent(topo.Shards, "", "  ")
+	fmt.Println(string(enc))
 }
 
-func runRegister(base, key string, args []string) {
+func runTopology(ctx context.Context, c *client.Client) {
+	topo, err := c.GetTopology(ctx)
+	printResult(topo, err)
+}
+
+func runRegister(ctx context.Context, c *client.Client, args []string) {
 	fs := flag.NewFlagSet("register", flag.ExitOnError)
-	uuid := fs.String("uuid", "", "shard uuid")
+	u := fs.String("uuid", "", "shard uuid")
 	dsn := fs.String("dsn", "", "postgres dsn")
 	role := fs.String("role", "data", "data|error")
 	url := fs.String("url", "", "advertise url")
 	_ = fs.Parse(args)
-	body, _ := json.Marshal(map[string]string{
-		"shard_uuid":    *uuid,
-		"dsn":           *dsn,
-		"role":          *role,
-		"advertise_url": *url,
-		"startup_state": "standby",
-		"cluster_key":   key,
+	resp, err := c.RegisterShard(ctx, &shardmanv1.RegisterShardRequest{
+		ShardUuid:    *u,
+		Dsn:          *dsn,
+		Role:         *role,
+		AdvertiseUrl: *url,
+		StartupState: "standby",
 	})
-	doPOST(base+"/v1/admin/shards", key, body)
+	printResult(resp, err)
 }
 
-func runResolve(base, path string, args []string) {
-	fs := flag.NewFlagSet("resolve", flag.ExitOnError)
+func runResolveWrite(ctx context.Context, c *client.Client, args []string) {
+	fs := flag.NewFlagSet("resolve-write", flag.ExitOnError)
 	keyVal := fs.String("key", "", "shard key")
 	_ = fs.Parse(args)
-	body, _ := json.Marshal(map[string]string{"shard_key": *keyVal})
-	req, _ := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	res, err := c.ResolveWrite(ctx, *keyVal)
+	printResult(res, err)
 }
 
-func runSealRotate(base, key string, args []string) {
+func runResolveRead(ctx context.Context, c *client.Client, args []string) {
+	fs := flag.NewFlagSet("resolve-read", flag.ExitOnError)
+	keyVal := fs.String("key", "", "shard key")
+	_ = fs.Parse(args)
+	res, err := c.ResolveRead(ctx, *keyVal)
+	printResult(res, err)
+}
+
+func runSealRotate(ctx context.Context, c *client.Client, args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	bucketID := fs.String("bucket", "", "bucket id")
 	_ = fs.Parse(args)
-	body, _ := json.Marshal(map[string]string{"bucket_id": *bucketID, "cluster_key": key})
-	doPOST(base+"/v1/admin/seal-rotate", key, body)
-}
-
-func doPOST(url, key string, body []byte) {
-	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Cluster-Key", key)
-	resp, err := http.DefaultClient.Do(req)
+	err := c.SealRotate(ctx, *bucketID)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	fmt.Println(`{"status":"rotated"}`)
 }
 
-func doGET(url, key string) {
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	req.Header.Set("X-Cluster-Key", key)
-	resp, err := http.DefaultClient.Do(req)
+func printResult(v any, err error) {
 	if err != nil {
-		fmt.Println(err)
+		if st, ok := status.FromError(err); ok {
+			fmt.Printf("error: %s (%s)\n", st.Message(), codes.Code(st.Code()))
+		} else {
+			fmt.Println(err)
+		}
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println()
+	enc, _ := json.MarshalIndent(v, "", "  ")
+	fmt.Println(string(enc))
 }
 
 func getenv(k, def string) string {

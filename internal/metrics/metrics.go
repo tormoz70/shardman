@@ -22,6 +22,17 @@ var (
 		Buckets: prometheus.DefBuckets,
 	}, []string{"method", "path"})
 
+	resolveDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "shardman_resolve_duration_seconds",
+		Help:    "Resolve RPC latency",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"op"})
+
+	activeShardsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shardman_active_shards",
+		Help: "Count of active data shards",
+	})
+
 	shardsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "shardman_shards",
 		Help: "Shard count by bucket and state",
@@ -71,6 +82,11 @@ var (
 		Name: "shardman_agent_last_seen_seconds",
 		Help: "Seconds since agent heartbeat",
 	}, []string{"shard_uuid"})
+
+	agentStatsErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "shardman_agent_stats_errors_total",
+		Help: "Failed agent stats reports",
+	})
 )
 
 func Handler() http.Handler {
@@ -98,13 +114,19 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-func IncSeal(bucketID string)        { sealTotal.WithLabelValues(bucketID).Inc() }
-func IncPromote(bucketID string)     { promoteTotal.WithLabelValues(bucketID).Inc() }
+func ObserveResolve(op string, d time.Duration) {
+	resolveDuration.WithLabelValues(op).Observe(d.Seconds())
+}
+
+func IncSeal(bucketID string)             { sealTotal.WithLabelValues(bucketID).Inc() }
+func IncPromote(bucketID string)          { promoteTotal.WithLabelValues(bucketID).Inc() }
 func IncStandbyExhausted(bucketID string) { standbyExhausted.WithLabelValues(bucketID).Inc() }
-func IncRetentionClean(bucketID string)   { retentionClean.WithLabelValues(bucketID).Inc() }
-func IncErrorRoute(reason string)    { errorRoute.WithLabelValues(reason).Inc() }
-func SetStandbyPool(n int)           { standbyPool.Set(float64(n)) }
-func SetErrorShardBytes(n int64)     { errorShardBytes.Set(float64(n)) }
+func IncRetentionClean(bucketID string)     { retentionClean.WithLabelValues(bucketID).Inc() }
+func IncErrorRoute(reason string)         { errorRoute.WithLabelValues(reason).Inc() }
+func IncAgentStatsError()                 { agentStatsErrors.Inc() }
+func SetStandbyPool(n int)                { standbyPool.Set(float64(n)) }
+func SetActiveShards(n int)               { activeShardsGauge.Set(float64(n)) }
+func SetErrorShardBytes(n int64)          { errorShardBytes.Set(float64(n)) }
 func SetAgentLastSeen(uuid string, secs float64) {
 	agentLastSeen.WithLabelValues(uuid).Set(secs)
 }

@@ -1,6 +1,7 @@
 .github/
 .idea/
 bin/
+tools/
 *.exe
 *.test
 .env

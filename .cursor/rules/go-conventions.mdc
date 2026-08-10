@@ -6,9 +6,11 @@ alwaysApply: false
 
 # Go conventions
 
-- Layout: `cmd/{server,agent,shardman}`, `internal/{bucket,fsm,store,resolve,api,seal,retention,metrics}`.
-- Domain logic in `internal/bucket` and `internal/fsm` — no chi/pgx imports there.
-- HTTP: chi; DB: pgx; logs: slog; metrics: Prometheus client.
-- Config via env (`METADATA_PG_DSN`, `CLUSTER_KEY`, `SEAL_CHECK_INTERVAL`).
-- Admin/internal auth: `X-Cluster-Key` header only.
+- Layout: `cmd/{server,agent,shardman}`, `internal/{bucket,fsm,store,resolve,grpcapi,seal,retention,metrics,topology}`, `pkg/client`, `api/proto`.
+- Domain logic in `internal/bucket` and `internal/fsm` — no grpc/pgx imports there.
+- API: gRPC + protobuf; ops HTTP only (`/healthz`, `/metrics`).
+- DB: pgx; logs: slog; metrics: Prometheus client; optional OTel OTLP.
+- Config via env (`METADATA_PG_DSN`, `GRPC_ADDR`, `HTTP_ADDR`, `CLUSTER_KEY`, `SEAL_CHECK_INTERVAL`, `DRAIN_TIMEOUT`).
+- Admin/internal auth: `x-cluster-key` gRPC metadata.
 - Integration tests: build tag `integration`, env `METADATA_PG_DSN`.
+- E2E tests: build tag `e2e`, testcontainers.

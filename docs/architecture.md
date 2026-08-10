@@ -6,49 +6,131 @@
 flowchart LR
   app[Application]
   cp[shardman_server]
-  meta[(Metadata_Postgres)]
+  meta[(Metadata_Postgres_via_PgBouncer)]
   agent[shardman_agent]
   data[(Data_Postgres_shards)]
 
-  app -->|HTTP resolve| cp
+  app -->|gRPC resolve/topology| cp
   cp --> meta
-  agent -->|stats/clean| cp
+  agent -->|gRPC Internal| cp
   agent --> data
   app -->|SQL| data
 ```
 
 Shardman does **not** proxy SQL. Applications:
 
-1. `POST /v1/resolve/write` with `shard_key`
-2. Connect to returned `endpoint` (Postgres DSN/URL)
-3. Execute SQL
+1. `Topology.Get` / `Topology.Watch` — cache routes (recommended)
+2. `Resolve.Write` / `Resolve.Read` with `shard_key` on cache miss
+3. Connect to returned `endpoint` (Postgres DSN/URL)
+4. Execute SQL
+
+## Repository layout
+
+```
+api/proto/shardman/v1/   protobuf services
+api/gen/                 generated Go stubs
+cmd/{server,agent,shardman}
+internal/{grpcapi,bucket,fsm,store,resolve,seal,retention,topology,metrics,oteltrace}
+pkg/client               Go SDK
+deploy/                  docker-compose, Prometheus, Tempo (tracing profile)
+```
 
 ## Components
 
 | Component | Package / binary | Responsibility |
 |-----------|------------------|----------------|
-| Server | `cmd/server` | HTTP API, metadata, seal + retention supervisors |
-| Agent | `cmd/agent` | `pg_database_size` heartbeat, execute clean |
-| CLI | `cmd/shardman` | Bootstrap, register, resolve, seal-rotate |
+| Server | `cmd/server` | gRPC API, metadata, seal + retention supervisors, ops HTTP |
+| Agent | `cmd/agent` | Size heartbeat (`SIZE_SOURCE`), drain revoke/terminate, truncate on `cleaning` |
+| CLI | `cmd/shardman` | Bootstrap, register, resolve, seal-rotate, topology |
+| Client SDK | `pkg/client` | Topology cache + `Watch`, resolve, scatter helper |
 | Core | `internal/bucket`, `internal/fsm` | Bucket IDs, routing, state machine |
-| Store | `internal/store` | Metadata persistence (pgx) |
+| Store | `internal/store` | Metadata persistence (pgx), migrations |
+| gRPC | `internal/grpcapi` | Service handlers |
+
+## API
+
+| Transport | Default | Endpoints |
+|-----------|---------|-----------|
+| gRPC | `GRPC_ADDR=:9090` (`:9091` in compose) | `Resolve`, `Topology`, `Admin`, `Internal` |
+| HTTP ops | `HTTP_ADDR=:8080` | `GET /healthz`, `GET /metrics` only |
+
+### gRPC services
+
+| Service | Auth | RPCs |
+|---------|------|------|
+| `ResolveService` | public | `Write`, `Read`, `ListBucketShards` |
+| `TopologyService` | public | `Get`, `Watch` (server stream) |
+| `AdminService` | `x-cluster-key` | `Bootstrap`, `ListShards`, `RegisterShard`, `SealRotate`, `PatchShardState`, `RetentionTick` |
+| `InternalService` | `x-cluster-key` | `ReportStats`, `ReportCleaned`, `ReportDrainComplete` |
+
+### Status codes
+
+| Condition | gRPC code |
+|-----------|-----------|
+| No active / standby exhausted | `Unavailable` |
+| Second bootstrap | `AlreadyExists` |
+| Bad/missing cluster key | `Unauthenticated` |
+| Seal / state conflict | `Aborted` / `NotFound` |
 
 ## Supervisors
 
-**Volume seal** (`internal/seal`): active data shard full → seal + promote standby for same bucket.
+**Volume seal** (`internal/seal`):
 
-**Retention** (`internal/retention`, time only): evicted time buckets → mark `cleaning` → agent truncates → `standby`.
+```
+active (full) → draining → agent drain → sealed → promote standby
+```
 
-## Security
+If no standby: sealed without promote; writes return `Unavailable` until standbys registered.
 
-Admin and `/v1/internal/*` require `X-Cluster-Key` (constant-time compare). Without `CLUSTER_KEY`, internal routes return 503.
+**Retention** (`internal/retention`, time axis only):
+
+```
+evicted bucket: sealed shards → cleaning → agent truncate → standby
+```
+
+Skips buckets that still have `active` or `draining` shards.
+
+## Metadata HA
+
+Production: metadata Postgres behind **PgBouncer** + external HA cluster. Shardman uses a single DSN; failover is an ops concern (no in-app reconnect logic).
+
+## Client routing contract
+
+- Cache topology by `topology_version`.
+- Invalidate on version bump, gRPC `Unavailable`, or write to sealed shard.
+- Do not call resolve on every SQL statement.
+
+## Hash analytics
+
+See [sharding-model.md](sharding-model.md#hash-mode-analytics). Scatter-gather is client responsibility; prefer OLAP for analytics.
 
 ## Observability
 
-Prometheus `/metrics` — HTTP, shard states, seal/promote, standby pool, error routes, retention clean.
+| Signal | Where |
+|--------|-------|
+| Prometheus metrics | `GET /metrics` on HTTP ops port |
+| Resolve latency | `shardman_resolve_duration_seconds{op=write\|read}` |
+| Active shards | `shardman_active_shards` |
+| Seal / promote / standby pool | `shardman_seal_total`, `shardman_promote_total`, `shardman_standby_pool_size` |
+| Agent heartbeat | `shardman_agent_last_seen_seconds` |
+| Error routing | `shardman_error_route_total`, `shardman_error_shard_bytes` |
+| OTel traces | `OTEL_EXPORTER_OTLP_ENDPOINT` → OTLP (optional Tempo profile in compose) |
 
-Deploy profile: `deploy/docker-compose.yml` (metadata + server + Prometheus + Grafana).
+Alert runbook: [runbook-alerts.md](runbook-alerts.md). Example rules: [deploy/alerts.yaml](../deploy/alerts.yaml).
+
+## Local stack (compose)
+
+```bash
+make docker-up
+# gRPC localhost:9091, metrics localhost:8080, metadata localhost:5433
+```
+
+Tracing profile:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=tempo:4317 docker compose -f deploy/docker-compose.yml --profile tracing up
+```
 
 ## Reference
 
-Lifecycle patterns borrowed from [little-big-files](https://github.com/tormoz70/little-big-files) (standby/active/sealed, hot-add, seal-rotate).
+Lifecycle patterns borrowed from [little-big-files](https://github.com/tormoz70/little-big-files).

@@ -9,6 +9,12 @@ func TestTransitions(t *testing.T) {
 	if CanTransition(RoleData, StateActive, StateStandby) {
 		t.Fatal("active->standby forbidden")
 	}
+	if !CanTransition(RoleData, StateActive, StateDraining) {
+		t.Fatal("active->draining")
+	}
+	if !CanTransition(RoleData, StateDraining, StateSealed) {
+		t.Fatal("draining->sealed")
+	}
 	if !CanTransition(RoleData, StateSealed, StateCleaning) {
 		t.Fatal("sealed->cleaning")
 	}

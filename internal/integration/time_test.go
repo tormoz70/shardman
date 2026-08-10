@@ -118,6 +118,13 @@ func TestTimeRetentionClean(t *testing.T) {
 	}
 
 	e.SetNow(time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC))
+	for _, sh := range e.ShardsInBucket("2026-04") {
+		if sh.State == fsm.StateActive {
+			if err := e.Store.PatchState(e.Ctx, sh.ID, fsm.StateSealed); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	if err := e.Retention.Tick(e.Ctx); err != nil {
 		t.Fatal(err)
 	}
