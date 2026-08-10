@@ -168,25 +168,58 @@ func (s *Service) ResolveRead(ctx context.Context, shardKey any) (*ReadResult, e
 	}, nil
 }
 
-func (s *Service) ensureActive(ctx context.Context, BucketID string) (*store.Shard, error) {
-	sh, err := s.Store.ActiveForBucket(ctx, BucketID)
+func (s *Service) ensureActive(ctx context.Context, bucketID string) (*store.Shard, error) {
+	sh, err := s.Store.ActiveForBucket(ctx, bucketID)
 	if err == nil {
 		return sh, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
-	promoted, err := s.Store.AutoPromoteIfNoActive(ctx, BucketID)
+	if err := s.failoverStaleActive(ctx, bucketID); err != nil {
+		return nil, err
+	}
+	sh, err = s.Store.ActiveForBucket(ctx, bucketID)
+	if err == nil {
+		return sh, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	promoted, err := s.Store.AutoPromoteIfNoActive(ctx, bucketID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			metrics.IncStandbyExhausted(BucketID)
+			metrics.IncStandbyExhausted(bucketID)
 			return nil, store.ErrNotFound
 		}
 		return nil, err
 	}
 	if promoted != nil {
-		metrics.IncPromote(BucketID)
+		metrics.IncPromote(bucketID)
 		return promoted, nil
 	}
-	return s.Store.ActiveForBucket(ctx, BucketID)
+	return s.Store.ActiveForBucket(ctx, bucketID)
+}
+
+func (s *Service) failoverStaleActive(ctx context.Context, bucketID string) error {
+	stale, err := s.Store.StaleActiveForBucket(ctx, bucketID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if stale == nil {
+		return nil
+	}
+	start := time.Now()
+	if err := s.Store.SealRotate(ctx, bucketID); err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) {
+			return nil
+		}
+		return err
+	}
+	metrics.ObserveSealDuration(time.Since(start))
+	metrics.IncHeartbeatFailover(bucketID)
+	return nil
 }

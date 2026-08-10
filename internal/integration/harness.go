@@ -38,7 +38,7 @@ func OpenEnv(t *testing.T) *Env {
 		t.Skip("METADATA_PG_DSN not set")
 	}
 	ctx := context.Background()
-	st, err := store.New(ctx, dsn)
+	st, err := store.New(ctx, dsn, store.Options{})
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}

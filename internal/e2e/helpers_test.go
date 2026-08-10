@@ -20,12 +20,12 @@ import (
 )
 
 func storeNew(ctx context.Context, dsn string) (*store.Store, error) {
-	return store.New(ctx, dsn)
+	return store.New(ctx, dsn, store.Options{})
 }
 
 func startTestServer(ctx context.Context, t *testing.T, metaDSN string) (string, func()) {
 	t.Helper()
-	st, err := store.New(ctx, metaDSN)
+	st, err := store.New(ctx, metaDSN, store.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

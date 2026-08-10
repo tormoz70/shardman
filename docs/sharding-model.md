@@ -94,6 +94,17 @@ Bootstrap: `mode=hash`, `bucket_axis=hash`, `bucket_spec={bucket_count, hash_alg
 ## Client integration
 
 1. `Topology.Watch` or poll `Get` — cache `topology_version` and shard endpoints.
-2. On write/read miss: `Resolve.Write` / `Resolve.Read` with `shard_key`.
-3. Connect to Postgres `endpoint` directly.
-4. Invalidate cache on `topology_version` bump or gRPC `Unavailable`.
+2. **Local resolve** (`pkg/client`): classify `shard_key` → `bucket_id`, pick active/sealed from cache — no gRPC on hit.
+3. On miss (no active, auto-promote, stale failover): `Resolve.Write` / `Resolve.Read` over gRPC.
+4. Connect to Postgres `endpoint` directly.
+5. Invalidate cache on `topology_version` bump, gRPC `Unavailable`, or sealed-shard write error.
+
+### Heartbeat / stale active
+
+Agents report `last_seen_at` via `Internal.ReportStats`. If a data **active** shard misses heartbeats for longer than `HEARTBEAT_TIMEOUT` (default 60s):
+
+- it is **soft-excluded** from resolve (still `state=active` in metadata)
+- `internal/health` supervisor auto `SealRotate`s to the next standby
+- error shard is never auto-rotated
+
+Sealed shards remain readable even when the agent is down (data on disk).

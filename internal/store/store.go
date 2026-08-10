@@ -15,6 +15,7 @@ import (
 
 	"github.com/tormoz70/shardman/internal/fsm"
 	"github.com/tormoz70/shardman/internal/bucket"
+	"github.com/tormoz70/shardman/internal/metrics"
 )
 
 //go:embed migrations/*.sql
@@ -55,16 +56,42 @@ type Shard struct {
 }
 
 type Store struct {
-	pool        *pgxpool.Pool
-	configCache atomic.Value // *ClusterConfig
+	pool             *pgxpool.Pool
+	configCache      atomic.Value // *ClusterConfig
+	heartbeatTimeout time.Duration
 }
 
-func New(ctx context.Context, dsn string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+type Options struct {
+	MaxConns         int32
+	HeartbeatTimeout time.Duration
+}
+
+func New(ctx context.Context, dsn string, opt Options) (*Store, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{pool: pool}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	if _, ok := cfg.ConnConfig.RuntimeParams["statement_timeout"]; !ok {
+		cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5000"
+	}
+	maxConns := opt.MaxConns
+	if maxConns <= 0 {
+		maxConns = 20
+	}
+	cfg.MaxConns = maxConns
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	hb := opt.HeartbeatTimeout
+	if hb <= 0 {
+		hb = 60 * time.Second
+	}
+	s := &Store{pool: pool, heartbeatTimeout: hb}
 	if err := s.Migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -171,12 +198,33 @@ func (s *Store) loadConfigFromDB(ctx context.Context) (*ClusterConfig, error) {
 	return &cfg, nil
 }
 
+func (s *Store) HeartbeatTimeout() time.Duration {
+	if s.heartbeatTimeout <= 0 {
+		return 60 * time.Second
+	}
+	return s.heartbeatTimeout
+}
+
+func (s *Store) heartbeatIntervalParam() string {
+	return s.HeartbeatTimeout().String()
+}
+
+// IsFresh reports whether the shard heartbeat is within the configured timeout.
+func (s *Store) IsFresh(sh *Shard, now time.Time) bool {
+	if sh == nil || sh.LastSeenAt == nil {
+		return false
+	}
+	return now.Sub(*sh.LastSeenAt) <= s.HeartbeatTimeout()
+}
+
 func (s *Store) GetConfig(ctx context.Context) (*ClusterConfig, error) {
 	if v := s.configCache.Load(); v != nil {
 		if cfg := v.(*ClusterConfig); cfg != nil {
+			metrics.IncResolveConfigCacheHit()
 			return cfg, nil
 		}
 	}
+	metrics.IncResolveConfigCacheMiss()
 	cfg, err := s.loadConfigFromDB(ctx)
 	if err != nil {
 		return nil, err
@@ -248,8 +296,8 @@ func (s *Store) RegisterShard(ctx context.Context, shardUUID uuid.UUID, role fsm
 
 	var id int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO shards (shard_uuid, role, state, dsn, advertise_url)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO shards (shard_uuid, role, state, dsn, advertise_url, last_seen_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
 		ON CONFLICT (shard_uuid) DO UPDATE SET
 			dsn = EXCLUDED.dsn,
 			advertise_url = EXCLUDED.advertise_url,
@@ -300,7 +348,10 @@ func (s *Store) GetErrorShard(ctx context.Context) (*Shard, error) {
 func (s *Store) ActiveForBucket(ctx context.Context, BucketID string) (*Shard, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT `+shardCols+` FROM shards
-		WHERE role = 'data' AND bucket_id = $1 AND state = 'active' LIMIT 1`, BucketID)
+		WHERE role = 'data' AND bucket_id = $1 AND state = 'active'
+		  AND last_seen_at IS NOT NULL
+		  AND last_seen_at >= NOW() - $2::interval
+		LIMIT 1`, BucketID, s.heartbeatIntervalParam())
 	sh, err := scanShard(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -308,11 +359,51 @@ func (s *Store) ActiveForBucket(ctx context.Context, BucketID string) (*Shard, e
 	return sh, err
 }
 
+func (s *Store) StaleActiveForBucket(ctx context.Context, BucketID string) (*Shard, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+shardCols+` FROM shards
+		WHERE role = 'data' AND bucket_id = $1 AND state = 'active'
+		  AND (last_seen_at IS NULL OR last_seen_at < NOW() - $2::interval)
+		LIMIT 1`, BucketID, s.heartbeatIntervalParam())
+	sh, err := scanShard(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return sh, err
+}
+
+func (s *Store) ListStaleActives(ctx context.Context) ([]Shard, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+shardCols+` FROM shards
+		WHERE role = 'data' AND state = 'active' AND bucket_id IS NOT NULL
+		  AND (last_seen_at IS NULL OR last_seen_at < NOW() - $1::interval)
+		ORDER BY id`, s.heartbeatIntervalParam())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Shard
+	for rows.Next() {
+		sh, err := scanShard(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *sh)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ShardsForBucketRead(ctx context.Context, BucketID string) ([]Shard, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+shardCols+` FROM shards
-		WHERE role = 'data' AND bucket_id = $1 AND state IN ('active', 'sealed')
-		ORDER BY id`, BucketID)
+		WHERE role = 'data' AND bucket_id = $1
+		  AND (
+		    state = 'sealed'
+		    OR (state = 'active'
+		        AND last_seen_at IS NOT NULL
+		        AND last_seen_at >= NOW() - $2::interval)
+		  )
+		ORDER BY id`, BucketID, s.heartbeatIntervalParam())
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +459,7 @@ func (s *Store) PromoteStandbyToActive(ctx context.Context, BucketID string) (*S
 	}
 
 	_, err = tx.Exec(ctx, `
-		UPDATE shards SET bucket_id = $1, state = 'active', updated_at = NOW(), version = version + 1
+		UPDATE shards SET bucket_id = $1, state = 'active', last_seen_at = NOW(), updated_at = NOW(), version = version + 1
 		WHERE id = $2`, BucketID, id)
 	if err != nil {
 		return nil, err
@@ -428,7 +519,7 @@ func (s *Store) SealRotate(ctx context.Context, BucketID string) error {
 	}
 
 	_, err = tx.Exec(ctx, `
-		UPDATE shards SET bucket_id = $1, state = 'active', updated_at = NOW(), version = version + 1
+		UPDATE shards SET bucket_id = $1, state = 'active', last_seen_at = NOW(), updated_at = NOW(), version = version + 1
 		WHERE id = $2`, BucketID, standbyID)
 	if err != nil {
 		return err
@@ -438,6 +529,11 @@ func (s *Store) SealRotate(ctx context.Context, BucketID string) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) SetLastSeenAt(ctx context.Context, shardUUID uuid.UUID, at time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE shards SET last_seen_at = $1, updated_at = NOW() WHERE shard_uuid = $2`, at, shardUUID)
+	return err
 }
 
 func (s *Store) UpdateStats(ctx context.Context, shardUUID uuid.UUID, reportedBytes int64) error {
@@ -606,6 +702,13 @@ func (s *Store) AutoPromoteIfNoActive(ctx context.Context, BucketID string) (*Sh
 	if !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
+	_, err = s.StaleActiveForBucket(ctx, BucketID)
+	if err == nil {
+		return nil, ErrNotFound
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
 	return s.PromoteStandbyToActive(ctx, BucketID)
 }
 
@@ -743,7 +846,7 @@ func (s *Store) CompleteDrainSeal(ctx context.Context, bucketID string) error {
 	}
 
 	_, err = tx.Exec(ctx, `
-		UPDATE shards SET bucket_id = $1, state = 'active', updated_at = NOW(), version = version + 1
+		UPDATE shards SET bucket_id = $1, state = 'active', last_seen_at = NOW(), updated_at = NOW(), version = version + 1
 		WHERE id = $2`, bucketID, standbyID)
 	if err != nil {
 		return err

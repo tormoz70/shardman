@@ -15,6 +15,20 @@ groups:
           severity: critical
         annotations:
           summary: "Shardman standby pool empty"
+      - alert: ShardmanHeartbeatFailover
+        expr: increase(shardman_heartbeat_failover_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shardman auto-failover on stale heartbeat (bucket {{ $labels.bucket_id }})"
+      - alert: ShardmanStaleActiveShards
+        expr: shardman_stale_active_shards > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shardman has stale active shards awaiting failover"
       - alert: ShardmanErrorRouteSpike
         expr: rate(shardman_error_route_total[5m]) > 10
         for: 5m

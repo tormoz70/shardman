@@ -14,6 +14,7 @@ import (
 
 	"github.com/tormoz70/shardman/internal/config"
 	"github.com/tormoz70/shardman/internal/grpcapi"
+	"github.com/tormoz70/shardman/internal/health"
 	"github.com/tormoz70/shardman/internal/metrics"
 	"github.com/tormoz70/shardman/internal/opshttp"
 	"github.com/tormoz70/shardman/internal/oteltrace"
@@ -39,7 +40,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := store.New(ctx, cfg.MetadataDSN)
+	st, err := store.New(ctx, cfg.MetadataDSN, store.Options{
+		MaxConns:         cfg.MetadataMaxConns,
+		HeartbeatTimeout: cfg.HeartbeatTimeout,
+	})
 	if err != nil {
 		slog.Error("store", "err", err)
 		os.Exit(1)
@@ -50,6 +54,7 @@ func main() {
 	bc := topology.NewBroadcast()
 	sealSup := &seal.Supervisor{Store: st, Interval: cfg.SealCheckInterval, DrainTimeout: cfg.DrainTimeout}
 	retSup := &retention.Supervisor{Store: st, Interval: cfg.SealCheckInterval}
+	healthSup := &health.Supervisor{Store: st, Interval: cfg.HealthCheckInterval}
 
 	srv := &grpcapi.Server{
 		Store:      st,
@@ -59,9 +64,11 @@ func main() {
 		RetSup:     retSup,
 		Broadcast:  bc,
 	}
+	healthSup.Notify = srv.NotifyTopology
 
 	go sealSup.Run(context.Background())
 	go retSup.Run(context.Background())
+	go healthSup.Run(context.Background())
 	go func() {
 		t := time.NewTicker(15 * time.Second)
 		defer t.Stop()

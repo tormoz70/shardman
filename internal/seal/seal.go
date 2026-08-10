@@ -62,11 +62,13 @@ func (s *Supervisor) tick(ctx context.Context) {
 			if !ready {
 				continue
 			}
+			start := time.Now()
 			if err := s.Store.CompleteDrainSeal(ctx, *sh.BucketID); err != nil {
 				s.Log.Warn("seal: complete drain failed", "bucket", *sh.BucketID, "err", err)
 				metrics.IncStandbyExhausted(*sh.BucketID)
 				continue
 			}
+			metrics.ObserveSealDuration(time.Since(start))
 			metrics.IncSeal(*sh.BucketID)
 			s.Log.Info("sealed after drain", "bucket", *sh.BucketID)
 		}

@@ -117,6 +117,9 @@ func (c *Client) TopologyVersion() int64 {
 }
 
 func (c *Client) ResolveWrite(ctx context.Context, shardKey any) (*resolve.WriteResult, error) {
+	if res, ok := c.tryResolveWriteLocal(shardKey); ok {
+		return res, nil
+	}
 	v, err := structpb.NewValue(shardKey)
 	if err != nil {
 		return nil, err
@@ -140,12 +143,18 @@ func (c *Client) ResolveWrite(ctx context.Context, shardKey any) (*resolve.Write
 }
 
 func (c *Client) ResolveRead(ctx context.Context, shardKey any) (*resolve.ReadResult, error) {
+	if res, ok := c.tryResolveReadLocal(shardKey); ok {
+		return res, nil
+	}
 	v, err := structpb.NewValue(shardKey)
 	if err != nil {
 		return nil, err
 	}
 	res, err := c.resolve.Read(ctx, &shardmanv1.ResolveReadRequest{ShardKey: v})
 	if err != nil {
+		if status.Code(err) == codes.Unavailable {
+			_ = c.refreshTopology(ctx)
+		}
 		return nil, err
 	}
 	out := &resolve.ReadResult{

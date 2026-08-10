@@ -60,6 +60,11 @@ func (s *Server) notifyTopology(ctx context.Context) {
 	}
 }
 
+// NotifyTopology broadcasts the current topology version to Watch subscribers.
+func (s *Server) NotifyTopology(ctx context.Context) {
+	s.notifyTopology(ctx)
+}
+
 func (s *Server) requireKey(ctx context.Context) error {
 	if s.ClusterKey == "" {
 		return status.Error(codes.Unavailable, "CLUSTER_KEY not configured")
@@ -398,8 +403,11 @@ func (s *Server) RefreshMetrics(ctx context.Context) {
 	metrics.SetActiveShards(active)
 	n, _ := s.Store.CountStandbyPool(ctx)
 	metrics.SetStandbyPool(n)
-	if s.Broadcast != nil {
-		if v, err := s.Store.GetTopologyVersion(ctx); err == nil {
+	stale, _ := s.Store.ListStaleActives(ctx)
+	metrics.SetStaleActiveShards(len(stale))
+	if v, err := s.Store.GetTopologyVersion(ctx); err == nil {
+		metrics.SetTopologyVersion(v)
+		if s.Broadcast != nil {
 			s.Broadcast.Notify(v)
 		}
 	}

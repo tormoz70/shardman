@@ -11,6 +11,12 @@ Prometheus metrics at `GET http://<HTTP_ADDR>/metrics` (default `:8080`). Exampl
 | `shardman_standby_pool_size` | gauge | Free standbys |
 | `shardman_standby_exhausted_total` | counter | Seal without standby |
 | `shardman_seal_total` | counter | Seal events per bucket |
+| `shardman_seal_duration_seconds` | histogram | Seal rotate / drain-complete duration |
+| `shardman_topology_version` | gauge | Current topology version |
+| `shardman_resolve_config_cache_hits_total` | counter | ClusterConfig cache hits |
+| `shardman_resolve_config_cache_misses_total` | counter | ClusterConfig cache misses |
+| `shardman_heartbeat_failover_total` | counter | Auto seal-rotate on stale active |
+| `shardman_stale_active_shards` | gauge | Stale active shards pending failover |
 | `shardman_agent_last_seen_seconds` | gauge | Agent heartbeat age |
 | `shardman_error_route_total` | counter | Routes to error shard |
 | `shardman_retention_clean_total` | counter | Retention evictions |
@@ -19,12 +25,24 @@ Prometheus metrics at `GET http://<HTTP_ADDR>/metrics` (default `:8080`). Exampl
 
 **Signal:** `shardman_agent_last_seen_seconds` > 120 for a shard UUID.
 
-**Meaning:** Agent stopped sending stats; seal/clean may stall.
+**Meaning:** Agent stopped sending stats; seal/clean may stall. Stale **data active** shards are excluded from resolve; `health` supervisor auto `SealRotate` when standby available.
 
 **Actions:**
 1. Check `shardman-agent` process on the host.
 2. Verify gRPC reachability to server `GRPC_ADDR`.
 3. Confirm `CLUSTER_KEY` matches server.
+4. Watch `shardman_heartbeat_failover_total` and `shardman_stale_active_shards`; if failover fails, register standbys.
+
+## Heartbeat failover
+
+**Signal:** `increase(shardman_heartbeat_failover_total[5m]) > 0` or `shardman_stale_active_shards > 0`.
+
+**Meaning:** Control plane detected stale active and attempted seal-rotate to standby.
+
+**Actions:**
+1. Confirm new active shard is healthy (`shardman_agent_last_seen_seconds` fresh).
+2. Investigate old sealed shard host; data remains on sealed shard for reads.
+3. If `shardman_stale_active_shards` persists, check standby pool and metadata DB connectivity.
 
 ## Standby pool exhausted
 

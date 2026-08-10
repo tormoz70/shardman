@@ -37,7 +37,7 @@ shardman bootstrap --axis numeric --width 1000 --max-bytes 1073741824
 
 | Binary | Role |
 |--------|------|
-| `shardman-server` | gRPC control plane + seal/retention loops + ops HTTP |
+| `shardman-server` | gRPC control plane + seal/retention/health loops + ops HTTP |
 | `shardman-agent` | Reports shard size, drain revoke, clean on `cleaning` |
 | `shardman` | CLI (gRPC client) |
 
@@ -56,11 +56,14 @@ shardman bootstrap --axis numeric --width 1000 --max-bytes 1073741824
 | Env | Default | Description |
 |-----|---------|-------------|
 | `METADATA_PG_DSN` | — | Metadata Postgres (PgBouncer DSN in prod) |
+| `METADATA_PG_MAX_CONNS` | `20` | pgxpool max connections to metadata DB |
 | `GRPC_ADDR` | `:9090` | gRPC listen (`:9091` in compose) |
 | `HTTP_ADDR` | `:8080` | Ops HTTP only |
 | `CLUSTER_KEY` | — | Admin/internal auth (`x-cluster-key` metadata) |
 | `SEAL_CHECK_INTERVAL` | `30s` | Seal + retention tick |
 | `DRAIN_TIMEOUT` | `30s` | Max wait in `draining` before force seal |
+| `HEARTBEAT_TIMEOUT` | `60s` | Stale agent threshold; stale data active excluded from resolve |
+| `HEALTH_CHECK_INTERVAL` | `15s` | Health supervisor tick (auto seal-rotate on stale active) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Optional OTLP traces (see runbook) |
 
 ## Config (agent)
@@ -89,11 +92,11 @@ shardman bootstrap --axis numeric --width 1000 --max-bytes 1073741824
 import "github.com/tormoz70/shardman/pkg/client"
 
 c, _ := client.Dial(ctx, "localhost:9091", client.Options{ClusterKey: os.Getenv("CLUSTER_KEY")})
-_ = c.WatchTopology(ctx)
-wr, _ := c.ResolveWrite(ctx, "2026-08-01T00:00:00Z")
+_ = c.WatchTopology(ctx) // push updates on topology_version bump
+wr, _ := c.ResolveWrite(ctx, "2026-08-01T00:00:00Z") // local resolve from cached topology
 ```
 
-Cache topology via `Watch` or `Get`; resolve on cache miss only.
+`Dial` loads topology via `Get`; `WatchTopology` keeps the cache fresh. `ResolveWrite` / `ResolveRead` resolve **locally** from the cached snapshot when the route and shard are present; on miss (no active, auto-promote needed) they fall back to gRPC. Invalidate on `topology_version` change, `Unavailable`, or sealed-shard write errors.
 
 Hash mode: string keys are case-insensitive (`"ABC"` and `"abc"` route to the same bucket).
 

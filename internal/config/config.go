@@ -8,24 +8,28 @@ import (
 )
 
 type Config struct {
-	GRPCAddr          string
-	HTTPAddr          string
-	MetadataDSN       string
-	ClusterKey        string
-	SealCheckInterval time.Duration
-	DrainTimeout      time.Duration
-	AgentReachTTL     time.Duration
+	GRPCAddr            string
+	HTTPAddr            string
+	MetadataDSN         string
+	ClusterKey          string
+	SealCheckInterval   time.Duration
+	DrainTimeout        time.Duration
+	HeartbeatTimeout    time.Duration
+	HealthCheckInterval time.Duration
+	MetadataMaxConns    int32
 }
 
 func LoadServer() (Config, error) {
 	c := Config{
-		GRPCAddr:          getenv("GRPC_ADDR", ":9090"),
-		HTTPAddr:          getenv("HTTP_ADDR", ":8080"),
-		MetadataDSN:       os.Getenv("METADATA_PG_DSN"),
-		ClusterKey:        os.Getenv("CLUSTER_KEY"),
-		SealCheckInterval: durationEnv("SEAL_CHECK_INTERVAL", 30*time.Second),
-		DrainTimeout:      durationEnv("DRAIN_TIMEOUT", 30*time.Second),
-		AgentReachTTL:     durationEnv("AGENT_REACH_TTL", 2*time.Minute),
+		GRPCAddr:            getenv("GRPC_ADDR", ":9090"),
+		HTTPAddr:            getenv("HTTP_ADDR", ":8080"),
+		MetadataDSN:         os.Getenv("METADATA_PG_DSN"),
+		ClusterKey:          os.Getenv("CLUSTER_KEY"),
+		SealCheckInterval:   durationEnv("SEAL_CHECK_INTERVAL", 30*time.Second),
+		DrainTimeout:        durationEnv("DRAIN_TIMEOUT", 30*time.Second),
+		HeartbeatTimeout:    durationEnv("HEARTBEAT_TIMEOUT", 60*time.Second),
+		HealthCheckInterval: durationEnv("HEALTH_CHECK_INTERVAL", 15*time.Second),
+		MetadataMaxConns:    int32(intEnv("METADATA_PG_MAX_CONNS", 20)),
 	}
 	if c.MetadataDSN == "" {
 		return c, fmt.Errorf("METADATA_PG_DSN required")
@@ -83,7 +87,7 @@ func durationEnv(k string, def time.Duration) time.Duration {
 	return d
 }
 
-func int64Env(k string, def int64) int64 {
+func intEnv(k string, def int64) int64 {
 	v := os.Getenv(k)
 	if v == "" {
 		return def

@@ -39,10 +39,10 @@ deploy/                  docker-compose, Prometheus, Tempo (tracing profile)
 
 | Component | Package / binary | Responsibility |
 |-----------|------------------|----------------|
-| Server | `cmd/server` | gRPC API, metadata, seal + retention supervisors, ops HTTP |
+| Server | `cmd/server` | gRPC API, metadata, seal + retention + health supervisors, ops HTTP |
 | Agent | `cmd/agent` | Size heartbeat (`SIZE_SOURCE`), drain revoke/terminate, truncate on `cleaning` |
 | CLI | `cmd/shardman` | Bootstrap, register, resolve, seal-rotate, topology |
-| Client SDK | `pkg/client` | Topology cache + `Watch`, resolve, scatter helper |
+| Client SDK | `pkg/client` | Topology cache + `Watch`, local resolve from cache, gRPC fallback, scatter helper |
 | Core | `internal/bucket`, `internal/fsm` | Bucket IDs, routing, state machine |
 | Store | `internal/store` | Metadata persistence (pgx), migrations, in-memory `ClusterConfig` cache |
 | gRPC | `internal/grpcapi` | Service handlers |
@@ -90,6 +90,14 @@ evicted bucket: sealed shards → cleaning → agent truncate → standby
 
 Skips buckets that still have `active` or `draining` shards.
 
+**Heartbeat health** (`internal/health`):
+
+```
+stale data active (last_seen_at > HEARTBEAT_TIMEOUT) → auto SealRotate → fresh standby active
+```
+
+Stale actives are soft-excluded from resolve; error shard is never auto-rotated.
+
 ## Metadata HA
 
 Production: metadata Postgres behind **PgBouncer** + external HA cluster. Shardman uses a single DSN; failover is an ops concern (no in-app reconnect logic).
@@ -107,6 +115,8 @@ Shard state changes and `topology_version` bumps run in the **same database tran
 ## Client routing contract
 
 - Cache topology by `topology_version`.
+- Resolve locally from cached topology when route + shard are present (`pkg/client`).
+- gRPC fallback on cache miss (auto-promote, stale failover).
 - Invalidate on version bump, gRPC `Unavailable`, or write to sealed shard.
 - Do not call resolve on every SQL statement.
 
@@ -121,7 +131,9 @@ See [sharding-model.md](sharding-model.md#hash-mode-analytics). Scatter-gather i
 | Prometheus metrics | `GET /metrics` on HTTP ops port |
 | Resolve latency | `shardman_resolve_duration_seconds{op=write\|read}` |
 | Active shards | `shardman_active_shards` |
-| Seal / promote / standby pool | `shardman_seal_total`, `shardman_promote_total`, `shardman_standby_pool_size` |
+| Seal / promote / standby pool | `shardman_seal_total`, `shardman_seal_duration_seconds`, `shardman_promote_total`, `shardman_standby_pool_size` |
+| Topology / config cache | `shardman_topology_version`, `shardman_resolve_config_cache_hits_total`, `shardman_resolve_config_cache_misses_total` |
+| Heartbeat failover | `shardman_heartbeat_failover_total`, `shardman_stale_active_shards` |
 | Agent heartbeat | `shardman_agent_last_seen_seconds` |
 | Error routing | `shardman_error_route_total`, `shardman_error_shard_bytes` |
 | OTel traces | `OTEL_EXPORTER_OTLP_ENDPOINT` → OTLP (optional Tempo profile in compose) |

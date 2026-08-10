@@ -87,6 +87,37 @@ var (
 		Name: "shardman_agent_stats_errors_total",
 		Help: "Failed agent stats reports",
 	})
+
+	topologyVersion = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shardman_topology_version",
+		Help: "Current cluster topology version",
+	})
+
+	resolveConfigCacheHits = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "shardman_resolve_config_cache_hits_total",
+		Help: "ClusterConfig cache hits on resolve hot path",
+	})
+
+	resolveConfigCacheMisses = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "shardman_resolve_config_cache_misses_total",
+		Help: "ClusterConfig cache misses on resolve hot path",
+	})
+
+	sealDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "shardman_seal_duration_seconds",
+		Help:    "Seal rotate and drain-complete duration",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	heartbeatFailoverTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shardman_heartbeat_failover_total",
+		Help: "Auto seal-rotate triggered by stale agent heartbeat",
+	}, []string{"bucket_id"})
+
+	staleActiveShards = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shardman_stale_active_shards",
+		Help: "Count of data active shards with stale heartbeat",
+	})
 )
 
 func Handler() http.Handler {
@@ -127,6 +158,14 @@ func IncAgentStatsError()                 { agentStatsErrors.Inc() }
 func SetStandbyPool(n int)                { standbyPool.Set(float64(n)) }
 func SetActiveShards(n int)               { activeShardsGauge.Set(float64(n)) }
 func SetErrorShardBytes(n int64)          { errorShardBytes.Set(float64(n)) }
+func SetTopologyVersion(v int64)            { topologyVersion.Set(float64(v)) }
+func IncResolveConfigCacheHit()           { resolveConfigCacheHits.Inc() }
+func IncResolveConfigCacheMiss()          { resolveConfigCacheMisses.Inc() }
+func ObserveSealDuration(d time.Duration) { sealDuration.Observe(d.Seconds()) }
+func IncHeartbeatFailover(bucketID string) {
+	heartbeatFailoverTotal.WithLabelValues(bucketID).Inc()
+}
+func SetStaleActiveShards(n int) { staleActiveShards.Set(float64(n)) }
 func SetAgentLastSeen(uuid string, secs float64) {
 	agentLastSeen.WithLabelValues(uuid).Set(secs)
 }

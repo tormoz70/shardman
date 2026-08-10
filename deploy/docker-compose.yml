@@ -19,10 +19,13 @@ services:
       dockerfile: deploy/Dockerfile
     environment:
       METADATA_PG_DSN: postgres://shardman:shardman@metadata:5432/shardman_meta?sslmode=disable
+      METADATA_PG_MAX_CONNS: "20"
       GRPC_ADDR: ":9091"
       HTTP_ADDR: ":8080"
       CLUSTER_KEY: dev-cluster-key
       SEAL_CHECK_INTERVAL: 10s
+      HEARTBEAT_TIMEOUT: 60s
+      HEALTH_CHECK_INTERVAL: 15s
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     ports:
       - "8080:8080"
