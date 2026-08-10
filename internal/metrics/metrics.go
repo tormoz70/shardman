@@ -24,23 +24,23 @@ var (
 
 	shardsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "shardman_shards",
-		Help: "Shard count by period and state",
-	}, []string{"period_id", "state"})
+		Help: "Shard count by bucket and state",
+	}, []string{"bucket_id", "state"})
 
 	reportedBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "shardman_shard_reported_bytes",
 		Help: "Reported bytes per shard",
-	}, []string{"shard_uuid", "period_id", "state"})
+	}, []string{"shard_uuid", "bucket_id", "state"})
 
 	sealTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "shardman_seal_total",
 		Help: "Seal events",
-	}, []string{"period_id"})
+	}, []string{"bucket_id"})
 
 	promoteTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "shardman_promote_total",
 		Help: "Promote events",
-	}, []string{"period_id"})
+	}, []string{"bucket_id"})
 
 	standbyPool = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "shardman_standby_pool_size",
@@ -50,12 +50,12 @@ var (
 	standbyExhausted = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "shardman_standby_exhausted_total",
 		Help: "No standby available",
-	}, []string{"period_id"})
+	}, []string{"bucket_id"})
 
 	retentionClean = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "shardman_retention_clean_total",
 		Help: "Retention clean events",
-	}, []string{"period_id"})
+	}, []string{"bucket_id"})
 
 	errorRoute = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "shardman_error_route_total",
@@ -98,20 +98,20 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-func IncSeal(periodID string)     { sealTotal.WithLabelValues(periodID).Inc() }
-func IncPromote(periodID string)   { promoteTotal.WithLabelValues(periodID).Inc() }
-func IncStandbyExhausted(pid string) { standbyExhausted.WithLabelValues(pid).Inc() }
-func IncRetentionClean(pid string) { retentionClean.WithLabelValues(pid).Inc() }
-func IncErrorRoute(reason string)  { errorRoute.WithLabelValues(reason).Inc() }
-func SetStandbyPool(n int)         { standbyPool.Set(float64(n)) }
-func SetErrorShardBytes(n int64)   { errorShardBytes.Set(float64(n)) }
+func IncSeal(bucketID string)        { sealTotal.WithLabelValues(bucketID).Inc() }
+func IncPromote(bucketID string)     { promoteTotal.WithLabelValues(bucketID).Inc() }
+func IncStandbyExhausted(bucketID string) { standbyExhausted.WithLabelValues(bucketID).Inc() }
+func IncRetentionClean(bucketID string)   { retentionClean.WithLabelValues(bucketID).Inc() }
+func IncErrorRoute(reason string)    { errorRoute.WithLabelValues(reason).Inc() }
+func SetStandbyPool(n int)           { standbyPool.Set(float64(n)) }
+func SetErrorShardBytes(n int64)     { errorShardBytes.Set(float64(n)) }
 func SetAgentLastSeen(uuid string, secs float64) {
 	agentLastSeen.WithLabelValues(uuid).Set(secs)
 }
 
-func UpdateShardGauges(periodID, state, uuid string, bytes int64) {
-	shardsGauge.WithLabelValues(periodID, state).Inc()
-	reportedBytes.WithLabelValues(uuid, periodID, state).Set(float64(bytes))
+func UpdateShardGauges(bucketID, state, uuid string, bytes int64) {
+	shardsGauge.WithLabelValues(bucketID, state).Inc()
+	reportedBytes.WithLabelValues(uuid, bucketID, state).Set(float64(bytes))
 }
 
 func ResetShardGauges() {

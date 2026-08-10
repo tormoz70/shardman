@@ -42,39 +42,49 @@ func main() {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage:
   shardman bootstrap --axis time --unit month --retention 3 --future 1 --max-bytes 1073741824
+  shardman bootstrap --axis hash --buckets 256 --max-bytes 1073741824
   shardman shards
   shardman register --uuid <uuid> --dsn <dsn> [--role error|data] [--url advertise]
   shardman resolve-write --key "2026-08-06T00:00:00Z"
   shardman resolve-read --key "2026-08-06T00:00:00Z"
-  shardman seal-rotate --period 2026-08
+  shardman seal-rotate --bucket 2026-08
 `)
 }
 
 func runBootstrap(base, key string, args []string) {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
-	axis := fs.String("axis", "time", "period axis")
+	axis := fs.String("axis", "time", "bucket axis: time|numeric|hash")
 	unit := fs.String("unit", "month", "time unit")
 	width := fs.Int64("width", 0, "numeric width")
-	retention := fs.Int("retention", 3, "retention depth")
-	future := fs.Int("future", 0, "max future periods")
+	buckets := fs.Int("buckets", 256, "hash bucket_count")
+	retention := fs.Int("retention", 3, "retention depth (time)")
+	future := fs.Int("future", 0, "max future buckets (time)")
 	maxBytes := fs.Int64("max-bytes", 1<<30, "shard max bytes")
 	_ = fs.Parse(args)
 
+	mode := "range"
 	var spec json.RawMessage
-	if *axis == "numeric" {
+	switch *axis {
+	case "numeric":
 		spec, _ = json.Marshal(map[string]int64{"width": *width})
-	} else {
+	case "hash":
+		mode = "hash"
+		spec, _ = json.Marshal(map[string]any{"bucket_count": *buckets, "hash_algo": "xxhash64"})
+	default:
 		spec, _ = json.Marshal(map[string]string{"unit": *unit})
 	}
-	body, _ := json.Marshal(map[string]any{
-		"mode":               "range",
-		"period_axis":        *axis,
-		"period_spec":        spec,
-		"shard_max_bytes":    *maxBytes,
-		"retention_depth":    *retention,
-		"max_future_periods": *future,
-		"cluster_key":        key,
-	})
+	bodyMap := map[string]any{
+		"mode":            mode,
+		"bucket_axis":     *axis,
+		"bucket_spec":     spec,
+		"shard_max_bytes": *maxBytes,
+		"cluster_key":     key,
+	}
+	if *axis == "time" {
+		bodyMap["retention_depth"] = *retention
+		bodyMap["max_future_buckets"] = *future
+	}
+	body, _ := json.Marshal(bodyMap)
 	doPOST(base+"/v1/admin/bootstrap", key, body)
 }
 
@@ -119,9 +129,9 @@ func runResolve(base, path string, args []string) {
 
 func runSealRotate(base, key string, args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
-	period := fs.String("period", "", "period id")
+	bucketID := fs.String("bucket", "", "bucket id")
 	_ = fs.Parse(args)
-	body, _ := json.Marshal(map[string]string{"period_id": *period, "cluster_key": key})
+	body, _ := json.Marshal(map[string]string{"bucket_id": *bucketID, "cluster_key": key})
 	doPOST(base+"/v1/admin/seal-rotate", key, body)
 }
 

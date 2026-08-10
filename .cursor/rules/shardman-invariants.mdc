@@ -1,19 +1,19 @@
 ---
-description: Shardman domain invariants — range sharding, FSM, control plane
+description: Shardman domain invariants — range/hash sharding, FSM, control plane
 alwaysApply: true
 ---
 
 # Shardman invariants
 
 - **Control plane only:** resolve topology via HTTP; apps talk to Postgres directly.
-- **Range MVP:** `period_axis` is `time` or `numeric`; chosen at bootstrap; never change live.
-- **No rebalance:** full shard → `sealed`; next `standby` → `active` for the same `period_id`.
-- **Single active per period:** enforce with DB partial unique index + transactional seal-rotate.
+- **Modes:** `range` (`bucket_axis` time|numeric) or `hash` (`bucket_axis=hash`); chosen at bootstrap; never change live.
+- **No rebalance:** full shard → `sealed`; next `standby` → `active` for the same `bucket_id`. Hash: never change `bucket_count`.
+- **Single active per bucket:** enforce with DB partial unique index + transactional seal-rotate.
 - **FSM:** only `standby → active → sealed`. Reject register as `active`/`sealed`.
-- **Write path:** `shard_key → period_id → active`. Missing active → auto-promote or `503`.
-- **Read path:** return `sealed ∪ active` for the period; never `standby`.
-- **Time retention:** `retention_depth`, pool `depth+1+max_future_periods+1(error)`; evicted periods cleaned and recycled.
-- **`max_future_periods`:** 0 → future data goes to error shard; N → allow N future periods.
+- **Write path:** `shard_key → bucket_id → active`. Missing active → auto-promote or `503`.
+- **Read path:** return `sealed ∪ active` for the bucket; never `standby`.
+- **Time retention:** `retention_depth`, pool `depth+1+max_future_buckets+1(error)`; evicted buckets cleaned and recycled.
+- **`max_future_buckets`:** 0 → future data goes to error shard; N → allow N future time buckets.
 - **Error shard:** one `role=error`, quarantine for out-of-model writes; never retention-cleaned.
 
 Do not invent SQL proxy, cross-shard migrations, or mode switching without updating `.ai/master-spec.yaml`.

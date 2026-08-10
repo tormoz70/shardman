@@ -15,7 +15,7 @@ import (
 
 	"github.com/tormoz70/shardman/internal/fsm"
 	"github.com/tormoz70/shardman/internal/metrics"
-	"github.com/tormoz70/shardman/internal/period"
+	"github.com/tormoz70/shardman/internal/bucket"
 	"github.com/tormoz70/shardman/internal/resolve"
 	"github.com/tormoz70/shardman/internal/retention"
 	"github.com/tormoz70/shardman/internal/seal"
@@ -40,7 +40,7 @@ func (s *Server) Router() http.Handler {
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/resolve/write", s.resolveWrite)
 		r.Post("/resolve/read", s.resolveRead)
-		r.Get("/periods/{period_id}/shards", s.periodShards)
+		r.Get("/buckets/{bucket_id}/shards", s.bucketShards)
 
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(s.requireClusterKey)
@@ -101,8 +101,8 @@ func (s *Server) resolveRead(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) periodShards(w http.ResponseWriter, r *http.Request) {
-	pid := chi.URLParam(r, "period_id")
+func (s *Server) bucketShards(w http.ResponseWriter, r *http.Request) {
+	pid := chi.URLParam(r, "bucket_id")
 	all, err := s.Store.ListShards(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -110,20 +110,20 @@ func (s *Server) periodShards(w http.ResponseWriter, r *http.Request) {
 	}
 	var filtered []store.Shard
 	for _, sh := range all {
-		if sh.PeriodID != nil && *sh.PeriodID == pid {
+		if sh.BucketID != nil && *sh.BucketID == pid {
 			filtered = append(filtered, sh)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"period_id": pid, "shards": filtered})
+	writeJSON(w, http.StatusOK, map[string]any{"bucket_id": pid, "shards": filtered})
 }
 
 type bootstrapReq struct {
 	Mode             string          `json:"mode"`
-	PeriodAxis       string          `json:"period_axis"`
-	PeriodSpec       json.RawMessage `json:"period_spec"`
+	BucketAxis       string          `json:"bucket_axis"`
+	BucketSpec       json.RawMessage `json:"bucket_spec"`
 	ShardMaxBytes    int64           `json:"shard_max_bytes"`
 	RetentionDepth   *int            `json:"retention_depth"`
-	MaxFuturePeriods *int            `json:"max_future_periods"`
+	MaxFutureBuckets *int            `json:"max_future_buckets"`
 }
 
 func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
@@ -133,14 +133,21 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Mode == "" {
-		req.Mode = "range"
+		if req.BucketAxis == string(bucket.AxisHash) {
+			req.Mode = bucket.ModeHash
+		} else {
+			req.Mode = bucket.ModeRange
+		}
 	}
-	axis := period.Axis(req.PeriodAxis)
-	if err := period.ValidateBootstrap(axis, req.RetentionDepth, req.MaxFuturePeriods); err != nil {
+	if req.Mode == bucket.ModeHash && req.BucketAxis == "" {
+		req.BucketAxis = string(bucket.AxisHash)
+	}
+	axis := bucket.Axis(req.BucketAxis)
+	if err := bucket.ValidateBootstrap(req.Mode, axis, req.RetentionDepth, req.MaxFutureBuckets); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	spec, err := period.ParseSpec(axis, req.PeriodSpec)
+	spec, err := bucket.ParseSpec(axis, req.BucketSpec)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -151,12 +158,12 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := store.ClusterConfig{
 		Mode:             req.Mode,
-		PeriodAxis:       axis,
-		PeriodSpec:       spec,
-		PeriodSpecRaw:    req.PeriodSpec,
+		BucketAxis:       axis,
+		BucketSpec:       spec,
+		BucketSpecRaw:    req.BucketSpec,
 		ShardMaxBytes:    req.ShardMaxBytes,
 		RetentionDepth:   req.RetentionDepth,
-		MaxFuturePeriods: req.MaxFuturePeriods,
+		MaxFutureBuckets: req.MaxFutureBuckets,
 	}
 	if err := s.Store.Bootstrap(r.Context(), cfg); err != nil {
 		if errors.Is(err, store.ErrAlreadyBootstrapped) {
@@ -167,8 +174,8 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	minShards := 0
-	if axis == period.AxisTime && req.RetentionDepth != nil && req.MaxFuturePeriods != nil {
-		minShards = period.MinShards(*req.RetentionDepth, *req.MaxFuturePeriods)
+	if axis == bucket.AxisTime && req.RetentionDepth != nil && req.MaxFutureBuckets != nil {
+		minShards = bucket.MinShards(*req.RetentionDepth, *req.MaxFutureBuckets)
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"status":     "bootstrapped",
@@ -222,7 +229,7 @@ func (s *Server) listShards(w http.ResponseWriter, r *http.Request) {
 }
 
 type sealRotateReq struct {
-	PeriodID   string `json:"period_id"`
+	BucketID   string `json:"bucket_id"`
 	ClusterKey string `json:"cluster_key"`
 }
 
@@ -232,7 +239,7 @@ func (s *Server) sealRotate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.Store.SealRotate(r.Context(), req.PeriodID); err != nil {
+	if err := s.Store.SealRotate(r.Context(), req.BucketID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, err)
 			return
@@ -240,8 +247,8 @@ func (s *Server) sealRotate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err)
 		return
 	}
-	metrics.IncSeal(req.PeriodID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "rotated", "period_id": req.PeriodID})
+	metrics.IncSeal(req.BucketID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "rotated", "bucket_id": req.BucketID})
 }
 
 func (s *Server) patchState(w http.ResponseWriter, r *http.Request) {
@@ -372,8 +379,8 @@ func (s *Server) RefreshMetrics(ctx context.Context) {
 	metrics.ResetShardGauges()
 	for _, sh := range shards {
 		pid := ""
-		if sh.PeriodID != nil {
-			pid = *sh.PeriodID
+		if sh.BucketID != nil {
+			pid = *sh.BucketID
 		}
 		metrics.UpdateShardGauges(pid, string(sh.State), sh.ShardUUID.String(), sh.ReportedBytes)
 		if sh.LastSeenAt != nil {

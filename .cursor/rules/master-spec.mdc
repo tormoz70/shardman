@@ -1,5 +1,5 @@
 ---
-description: Pointer to Shardman agent master-spec (SoT for domain and guardrails)
+description: Always read/update master-spec when changing contracts
 alwaysApply: true
 ---
 
@@ -14,7 +14,7 @@ Before changing API, invariants, sharding semantics, or acceptance:
 Hard rules (summary):
 
 - MVP = control plane only (no SQL proxy, no tenant-per-shard).
-- `period_axis` / `period_spec` / `mode` immutable after bootstrap.
-- Exactly one `active` shard per `period_id`; FSM `standby → active → sealed`.
+- `mode` / `bucket_axis` / `bucket_spec` immutable after bootstrap.
+- Exactly one `active` shard per `bucket_id`; FSM `standby → active → sealed`.
 - Hot-add only as `standby`; admin/internal need `CLUSTER_KEY`.
 - GitHub remotes: SSH only — never fall back to HTTPS on key errors.

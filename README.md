@@ -1,6 +1,6 @@
 # shardman
 
-External **control plane** for PostgreSQL range sharding (Go). Apps resolve write/read targets via HTTP; data lives on Postgres shards.
+External **control plane** for PostgreSQL range/hash sharding (Go). Apps resolve write/read targets via HTTP; data lives on Postgres shards.
 
 ## Quick start
 
@@ -12,7 +12,10 @@ Bootstrap (from host with CLI built, or exec into container):
 
 ```bash
 export CLUSTER_KEY=dev-cluster-key
+# range + time
 shardman bootstrap --axis time --unit month --retention 3 --future 1 --max-bytes 1073741824
+# or hash (fixed buckets, no rebalance)
+# shardman bootstrap --axis hash --buckets 256 --max-bytes 1073741824
 shardman register --uuid $(uuidgen) --role error --dsn postgres://err/db
 shardman register --uuid $(uuidgen) --dsn postgres://shard1/db
 shardman resolve-write --key "2026-08-01T00:00:00Z"
@@ -39,11 +42,11 @@ curl http://localhost:8080/metrics
 ## Time-axis pool sizing
 
 ```
-min_shards = retention_depth + 1 + max_future_periods + 1(error)
+min_shards = retention_depth + 1 + max_future_buckets + 1(error)
 ```
 
-- `max_future_periods=0` → future timestamps route to **error shard**
-- `max_future_periods=N` → up to N future periods accept normal writes
+- `max_future_buckets=0` → future timestamps route to **error shard**
+- `max_future_buckets=N` → up to N future time buckets accept normal writes
 
 ## Docs
 
@@ -52,12 +55,23 @@ min_shards = retention_depth + 1 + max_future_periods + 1(error)
 - [docs/architecture.md](docs/architecture.md)
 - [.ai/master-spec.yaml](.ai/master-spec.yaml)
 
+## Integration tests
+
+Requires metadata Postgres (e.g. `make docker-up` exposes `:5433`):
+
+```bash
+make test-stand          # docker-up + integration suite
+make test-integration    # METADATA_PG_DSN defaults to localhost:5433
+```
+
+Covers time / numeric / hash modes via `internal/integration` (control plane only; fake shard DSNs). Not covered: real data Postgres SQL, agent `pg_database_size` e2e.
+
 ## Build
 
 ```bash
 make build
 make test
-METADATA_PG_DSN=postgres://... make test-integration
+make test-integration
 ```
 
 GitHub remotes: **SSH only** (`git@github.com:...`).

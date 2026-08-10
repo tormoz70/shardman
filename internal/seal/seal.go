@@ -46,16 +46,16 @@ func (s *Supervisor) tick(ctx context.Context) {
 		return
 	}
 	for _, sh := range need {
-		if sh.PeriodID == nil {
+		if sh.BucketID == nil {
 			continue
 		}
-		if err := s.Store.SealRotate(ctx, *sh.PeriodID); err != nil {
-			s.Log.Warn("seal rotate failed", "period", *sh.PeriodID, "err", err)
-			metrics.IncStandbyExhausted(*sh.PeriodID)
+		if err := s.Store.SealRotate(ctx, *sh.BucketID); err != nil {
+			s.Log.Warn("seal rotate failed", "bucket", *sh.BucketID, "err", err)
+			metrics.IncStandbyExhausted(*sh.BucketID)
 			continue
 		}
-		metrics.IncSeal(*sh.PeriodID)
-		s.Log.Info("sealed and rotated", "period", *sh.PeriodID)
+		metrics.IncSeal(*sh.BucketID)
+		s.Log.Info("sealed and rotated", "bucket", *sh.BucketID)
 	}
 	n, _ := s.Store.CountStandbyPool(ctx)
 	metrics.SetStandbyPool(n)

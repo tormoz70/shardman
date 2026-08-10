@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tormoz70/shardman/internal/fsm"
-	"github.com/tormoz70/shardman/internal/period"
+	"github.com/tormoz70/shardman/internal/bucket"
 )
 
 //go:embed migrations/*.sql
@@ -28,27 +28,27 @@ var (
 
 type ClusterConfig struct {
 	Mode             string
-	PeriodAxis       period.Axis
-	PeriodSpec       period.Spec
-	PeriodSpecRaw    json.RawMessage
+	BucketAxis       bucket.Axis
+	BucketSpec       bucket.Spec
+	BucketSpecRaw    json.RawMessage
 	ShardMaxBytes    int64
 	RetentionDepth   *int
-	MaxFuturePeriods *int
+	MaxFutureBuckets *int
 }
 
 type Shard struct {
-	ID             int64
-	ShardUUID      uuid.UUID
-	Role           fsm.Role
-	PeriodID       *string
-	State          fsm.State
-	DSN            string
-	AdvertiseURL   *string
-	ReportedBytes  int64
-	MaxBytes       *int64
-	LastSeenAt     *time.Time
-	SealedAt       *time.Time
-	Version        int64
+	ID            int64      `json:"id"`
+	ShardUUID     uuid.UUID  `json:"shard_uuid"`
+	Role          fsm.Role   `json:"role"`
+	BucketID      *string    `json:"bucket_id,omitempty"`
+	State         fsm.State  `json:"state"`
+	DSN           string     `json:"dsn"`
+	AdvertiseURL  *string    `json:"advertise_url,omitempty"`
+	ReportedBytes int64      `json:"reported_bytes"`
+	MaxBytes      *int64     `json:"max_bytes,omitempty"`
+	LastSeenAt    *time.Time `json:"last_seen_at,omitempty"`
+	SealedAt      *time.Time `json:"sealed_at,omitempty"`
+	Version       int64      `json:"version"`
 }
 
 type Store struct {
@@ -81,6 +81,14 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return err
 }
 
+// ResetSchema drops and recreates public schema then reapplies migrations (integration tests).
+func (s *Store) ResetSchema(ctx context.Context) error {
+	if _, err := s.pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+		return err
+	}
+	return s.Migrate(ctx)
+}
+
 func (s *Store) Bootstrap(ctx context.Context, cfg ClusterConfig) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -97,34 +105,34 @@ func (s *Store) Bootstrap(ctx context.Context, cfg ClusterConfig) error {
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO cluster_config (mode, period_axis, period_spec, shard_max_bytes, retention_depth, max_future_periods)
+		INSERT INTO cluster_config (mode, bucket_axis, bucket_spec, shard_max_bytes, retention_depth, max_future_buckets)
 		VALUES ($1, $2, $3, $4, $5, $6)`,
-		cfg.Mode, cfg.PeriodAxis, cfg.PeriodSpecRaw, cfg.ShardMaxBytes, cfg.RetentionDepth, cfg.MaxFuturePeriods,
+		cfg.Mode, cfg.BucketAxis, cfg.BucketSpecRaw, cfg.ShardMaxBytes, cfg.RetentionDepth, cfg.MaxFutureBuckets,
 	)
 	return tx.Commit(ctx)
 }
 
 func (s *Store) GetConfig(ctx context.Context) (*ClusterConfig, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT mode, period_axis, period_spec, shard_max_bytes, retention_depth, max_future_periods
+		SELECT mode, bucket_axis, bucket_spec, shard_max_bytes, retention_depth, max_future_buckets
 		FROM cluster_config WHERE id = 1`)
 
 	var cfg ClusterConfig
 	var raw []byte
 	var axis string
-	if err := row.Scan(&cfg.Mode, &axis, &raw, &cfg.ShardMaxBytes, &cfg.RetentionDepth, &cfg.MaxFuturePeriods); err != nil {
+	if err := row.Scan(&cfg.Mode, &axis, &raw, &cfg.ShardMaxBytes, &cfg.RetentionDepth, &cfg.MaxFutureBuckets); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotBootstrapped
 		}
 		return nil, err
 	}
-	cfg.PeriodAxis = period.Axis(axis)
-	cfg.PeriodSpecRaw = raw
-	spec, err := period.ParseSpec(cfg.PeriodAxis, raw)
+	cfg.BucketAxis = bucket.Axis(axis)
+	cfg.BucketSpecRaw = raw
+	spec, err := bucket.ParseSpec(cfg.BucketAxis, raw)
 	if err != nil {
 		return nil, err
 	}
-	cfg.PeriodSpec = spec
+	cfg.BucketSpec = spec
 	return &cfg, nil
 }
 
@@ -132,7 +140,7 @@ func scanShard(row pgx.Row) (*Shard, error) {
 	var sh Shard
 	var role, state string
 	err := row.Scan(
-		&sh.ID, &sh.ShardUUID, &role, &sh.PeriodID, &state,
+		&sh.ID, &sh.ShardUUID, &role, &sh.BucketID, &state,
 		&sh.DSN, &sh.AdvertiseURL, &sh.ReportedBytes, &sh.MaxBytes,
 		&sh.LastSeenAt, &sh.SealedAt, &sh.Version,
 	)
@@ -144,7 +152,7 @@ func scanShard(row pgx.Row) (*Shard, error) {
 	return &sh, nil
 }
 
-const shardCols = `id, shard_uuid, role, period_id, state, dsn, advertise_url, reported_bytes, max_bytes, last_seen_at, sealed_at, version`
+const shardCols = `id, shard_uuid, role, bucket_id, state, dsn, advertise_url, reported_bytes, max_bytes, last_seen_at, sealed_at, version`
 
 func (s *Store) ListShards(ctx context.Context) ([]Shard, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+shardCols+` FROM shards ORDER BY id`)
@@ -237,10 +245,10 @@ func (s *Store) GetErrorShard(ctx context.Context) (*Shard, error) {
 	return sh, err
 }
 
-func (s *Store) ActiveForPeriod(ctx context.Context, periodID string) (*Shard, error) {
+func (s *Store) ActiveForBucket(ctx context.Context, BucketID string) (*Shard, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT `+shardCols+` FROM shards
-		WHERE role = 'data' AND period_id = $1 AND state = 'active' LIMIT 1`, periodID)
+		WHERE role = 'data' AND bucket_id = $1 AND state = 'active' LIMIT 1`, BucketID)
 	sh, err := scanShard(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -248,11 +256,11 @@ func (s *Store) ActiveForPeriod(ctx context.Context, periodID string) (*Shard, e
 	return sh, err
 }
 
-func (s *Store) ShardsForPeriodRead(ctx context.Context, periodID string) ([]Shard, error) {
+func (s *Store) ShardsForBucketRead(ctx context.Context, BucketID string) ([]Shard, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+shardCols+` FROM shards
-		WHERE role = 'data' AND period_id = $1 AND state IN ('active', 'sealed')
-		ORDER BY id`, periodID)
+		WHERE role = 'data' AND bucket_id = $1 AND state IN ('active', 'sealed')
+		ORDER BY id`, BucketID)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +279,7 @@ func (s *Store) ShardsForPeriodRead(ctx context.Context, periodID string) ([]Sha
 func (s *Store) StandbyPool(ctx context.Context) ([]Shard, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+shardCols+` FROM shards
-		WHERE role = 'data' AND state = 'standby' AND period_id IS NULL
+		WHERE role = 'data' AND state = 'standby' AND bucket_id IS NULL
 		ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -288,7 +296,7 @@ func (s *Store) StandbyPool(ctx context.Context) ([]Shard, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) PromoteStandbyToActive(ctx context.Context, periodID string) (*Shard, error) {
+func (s *Store) PromoteStandbyToActive(ctx context.Context, BucketID string) (*Shard, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -298,7 +306,7 @@ func (s *Store) PromoteStandbyToActive(ctx context.Context, periodID string) (*S
 	var id int64
 	err = tx.QueryRow(ctx, `
 		SELECT id FROM shards
-		WHERE role = 'data' AND state = 'standby' AND period_id IS NULL
+		WHERE role = 'data' AND state = 'standby' AND bucket_id IS NULL
 		ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -308,8 +316,8 @@ func (s *Store) PromoteStandbyToActive(ctx context.Context, periodID string) (*S
 	}
 
 	_, err = tx.Exec(ctx, `
-		UPDATE shards SET period_id = $1, state = 'active', updated_at = NOW(), version = version + 1
-		WHERE id = $2`, periodID, id)
+		UPDATE shards SET bucket_id = $1, state = 'active', updated_at = NOW(), version = version + 1
+		WHERE id = $2`, BucketID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +327,7 @@ func (s *Store) PromoteStandbyToActive(ctx context.Context, periodID string) (*S
 	return s.GetShardByID(ctx, id)
 }
 
-func (s *Store) SealRotate(ctx context.Context, periodID string) error {
+func (s *Store) SealRotate(ctx context.Context, BucketID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -330,8 +338,8 @@ func (s *Store) SealRotate(ctx context.Context, periodID string) error {
 	var activeVer int64
 	err = tx.QueryRow(ctx, `
 		SELECT id, version FROM shards
-		WHERE role = 'data' AND period_id = $1 AND state = 'active'
-		FOR UPDATE`, periodID).Scan(&activeID, &activeVer)
+		WHERE role = 'data' AND bucket_id = $1 AND state = 'active'
+		FOR UPDATE`, BucketID).Scan(&activeID, &activeVer)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -352,7 +360,7 @@ func (s *Store) SealRotate(ctx context.Context, periodID string) error {
 	var standbyID int64
 	err = tx.QueryRow(ctx, `
 		SELECT id FROM shards
-		WHERE role = 'data' AND state = 'standby' AND period_id IS NULL
+		WHERE role = 'data' AND state = 'standby' AND bucket_id IS NULL
 		ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&standbyID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return tx.Commit(ctx)
@@ -362,12 +370,12 @@ func (s *Store) SealRotate(ctx context.Context, periodID string) error {
 	}
 
 	_, err = tx.Exec(ctx, `
-		UPDATE shards SET period_id = $1, state = 'active', updated_at = NOW(), version = version + 1
-		WHERE id = $2`, periodID, standbyID)
+		UPDATE shards SET bucket_id = $1, state = 'active', updated_at = NOW(), version = version + 1
+		WHERE id = $2`, BucketID, standbyID)
 	if err != nil {
 		return err
 	}
-	_, _ = tx.Exec(ctx, `INSERT INTO shard_events (shard_id, period_id, event_type) VALUES ($1, $2, 'seal_rotate')`, activeID, periodID)
+	_, _ = tx.Exec(ctx, `INSERT INTO shard_events (shard_id, bucket_id, event_type) VALUES ($1, $2, 'seal_rotate')`, activeID, BucketID)
 	return tx.Commit(ctx)
 }
 
@@ -398,10 +406,10 @@ func (s *Store) PatchState(ctx context.Context, id int64, newState fsm.State) er
 	return err
 }
 
-func (s *Store) MarkPeriodCleaning(ctx context.Context, periodID string) (int64, error) {
+func (s *Store) MarkBucketCleaning(ctx context.Context, BucketID string) (int64, error) {
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE shards SET state = 'cleaning', updated_at = NOW(), version = version + 1
-		WHERE role = 'data' AND period_id = $1 AND state IN ('sealed', 'active')`, periodID)
+		WHERE role = 'data' AND bucket_id = $1 AND state IN ('sealed', 'active')`, BucketID)
 	if err != nil {
 		return 0, err
 	}
@@ -410,16 +418,16 @@ func (s *Store) MarkPeriodCleaning(ctx context.Context, periodID string) (int64,
 
 func (s *Store) FinishCleaning(ctx context.Context, shardUUID uuid.UUID) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE shards SET state = 'standby', period_id = NULL, reported_bytes = 0,
+		UPDATE shards SET state = 'standby', bucket_id = NULL, reported_bytes = 0,
 			sealed_at = NULL, updated_at = NOW(), version = version + 1
 		WHERE shard_uuid = $1 AND state = 'cleaning'`, shardUUID)
 	return err
 }
 
-func (s *Store) DistinctPeriodIDs(ctx context.Context) ([]string, error) {
+func (s *Store) DistinctBucketIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT period_id FROM shards
-		WHERE role = 'data' AND period_id IS NOT NULL`)
+		SELECT DISTINCT bucket_id FROM shards
+		WHERE role = 'data' AND bucket_id IS NOT NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -466,19 +474,19 @@ func (s *Store) CountStandbyPool(ctx context.Context) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM shards
-		WHERE role = 'data' AND state = 'standby' AND period_id IS NULL`).Scan(&n)
+		WHERE role = 'data' AND state = 'standby' AND bucket_id IS NULL`).Scan(&n)
 	return n, err
 }
 
-func (s *Store) AutoPromoteIfNoActive(ctx context.Context, periodID string) (*Shard, error) {
-	_, err := s.ActiveForPeriod(ctx, periodID)
+func (s *Store) AutoPromoteIfNoActive(ctx context.Context, BucketID string) (*Shard, error) {
+	_, err := s.ActiveForBucket(ctx, BucketID)
 	if err == nil {
 		return nil, nil
 	}
 	if !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
-	return s.PromoteStandbyToActive(ctx, periodID)
+	return s.PromoteStandbyToActive(ctx, BucketID)
 }
 
 func nullStr(s string) *string {

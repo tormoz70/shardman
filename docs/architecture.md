@@ -30,14 +30,14 @@ Shardman does **not** proxy SQL. Applications:
 | Server | `cmd/server` | HTTP API, metadata, seal + retention supervisors |
 | Agent | `cmd/agent` | `pg_database_size` heartbeat, execute clean |
 | CLI | `cmd/shardman` | Bootstrap, register, resolve, seal-rotate |
-| Core | `internal/period`, `internal/fsm` | Period IDs, routing, state machine |
+| Core | `internal/bucket`, `internal/fsm` | Bucket IDs, routing, state machine |
 | Store | `internal/store` | Metadata persistence (pgx) |
 
 ## Supervisors
 
-**Volume seal** (`internal/seal`): active data shard full → seal + promote standby for same period.
+**Volume seal** (`internal/seal`): active data shard full → seal + promote standby for same bucket.
 
-**Retention** (`internal/retention`, time only): evicted periods → mark `cleaning` → agent truncates → `standby`.
+**Retention** (`internal/retention`, time only): evicted time buckets → mark `cleaning` → agent truncates → `standby`.
 
 ## Security
 

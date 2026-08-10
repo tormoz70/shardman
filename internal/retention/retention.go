@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/tormoz70/shardman/internal/metrics"
-	"github.com/tormoz70/shardman/internal/period"
+	"github.com/tormoz70/shardman/internal/bucket"
 	"github.com/tormoz70/shardman/internal/store"
 )
 
@@ -45,30 +45,30 @@ func (s *Supervisor) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if cfg.PeriodAxis != period.AxisTime || cfg.RetentionDepth == nil {
+	if cfg.BucketAxis != bucket.AxisTime || cfg.RetentionDepth == nil {
 		return nil
 	}
 	now := time.Now().UTC()
 	if s.Now != nil {
 		now = s.Now()
 	}
-	known, err := s.Store.DistinctPeriodIDs(ctx)
+	known, err := s.Store.DistinctBucketIDs(ctx)
 	if err != nil {
 		return err
 	}
-	evict, err := period.PeriodsOutsideRetention(cfg.PeriodSpec, now, *cfg.RetentionDepth, known)
+	evict, err := bucket.BucketsOutsideRetention(cfg.BucketSpec, now, *cfg.RetentionDepth, known)
 	if err != nil {
 		return err
 	}
 	for _, pid := range evict {
-		n, err := s.Store.MarkPeriodCleaning(ctx, pid)
+		n, err := s.Store.MarkBucketCleaning(ctx, pid)
 		if err != nil {
-			s.Log.Warn("retention mark cleaning", "period", pid, "err", err)
+			s.Log.Warn("retention mark cleaning", "bucket", pid, "err", err)
 			continue
 		}
 		if n > 0 {
 			metrics.IncRetentionClean(pid)
-			s.Log.Info("retention evict", "period", pid, "shards", n)
+			s.Log.Info("retention evict", "bucket", pid, "shards", n)
 		}
 	}
 	return nil

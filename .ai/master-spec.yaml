@@ -2,13 +2,13 @@
 # META
 # ==============================================================================
 agent_name: "Shardman_ControlPlane_Agent"
-version: "0.2.0"
+version: "0.3.0"
 target_repository: "git@github.com:tormoz70/shardman.git"
-last_updated: "2026-08-07"
+last_updated: "2026-08-10"
 purpose: >
-  Помощь в разработке shardman — Go control plane для range-шардирования PostgreSQL.
-  Инварианты: immutable bootstrap, volume subshards, time retention ring,
-  max_future_periods, error shard, resolve API, seal/retention supervisors.
+  Помощь в разработке shardman — Go control plane для range/hash-шардирования PostgreSQL.
+  Инварианты: immutable bootstrap, bucket_id routing, volume subshards, time retention ring,
+  max_future_buckets, error shard, resolve API, seal/retention supervisors.
 
 related_context:
   - "docs/master-spec.md"
@@ -21,7 +21,7 @@ related_context:
 # 1. PERSONA
 # ==============================================================================
 persona: >
-  Ведущий Go backend engineer. Сохранять инварианты period/FSM/retention/error-shard.
+  Ведущий Go backend engineer. Сохранять инварианты bucket/FSM/retention/error-shard.
   Изменение API — обновить `.ai/master-spec.yaml` и `docs/master-spec.md`.
 
 # ==============================================================================
@@ -38,7 +38,7 @@ domain_knowledge:
     - "GitHub: SSH only"
 
   layout:
-    - "internal/period — period_id, ClassifyWrite, retention"
+    - "internal/bucket — bucket_id, ClassifyWrite, retention, hash"
     - "internal/fsm — standby/active/sealed/cleaning, data/error roles"
     - "internal/store — metadata repository"
     - "internal/resolve — write/read routing"
@@ -48,21 +48,30 @@ domain_knowledge:
     - "internal/metrics — Prometheus"
 
   sharding:
-    mode: "range"
-    volume_subshards: "standby→active→sealed per period_id; one active per period"
+    nesting: "shard_key → bucket_id → volume subshards"
+    modes:
+      range:
+        axes: ["time", "numeric"]
+      hash:
+        axis: "hash"
+        bucket_count: "immutable at bootstrap"
+        hash_algo: "xxhash64"
+        no_retention_error_required: true
+    volume_subshards: "standby→active→sealed per bucket_id; one active per bucket"
     time_retention:
-      min_shards: "retention_depth + 1 + max_future_periods + 1(error)"
-      eviction: "all data subshards of period → cleaning → agent truncate → standby"
-      wall_clock: "retention anchored to wall-clock, not max written period"
-    max_future_periods:
-      zero: "future timestamps → error shard (not normal periods)"
-      positive: "allow writes up to current+N future periods"
+      min_shards: "retention_depth + 1 + max_future_buckets + 1(error)"
+      eviction: "all data subshards of bucket → cleaning → agent truncate → standby"
+      wall_clock: "retention anchored to wall-clock, not max written bucket"
+    max_future_buckets:
+      zero: "future timestamps → error shard (not normal buckets)"
+      positive: "allow writes up to current+N future time buckets"
     error_shard:
       count: 1
       role: "error"
       routes: "too-future, evicted past, invalid key"
       no_retention_clean: true
     numeric_mvp: "volume subshards only; no retention/error required"
+    hash_mvp: "fixed bucket_count; volume seal; no rebalance; no generations in MVP"
 
   guardrails:
     - "Bootstrap immutable; second bootstrap → 409"
@@ -70,14 +79,14 @@ domain_knowledge:
     - "Only one error shard"
     - "No SQL proxy in MVP"
     - "CLUSTER_KEY on admin/internal"
-    - "No rebalance / period_spec change"
+    - "No rebalance / bucket_spec change / bucket_count change"
 
 # ==============================================================================
 # 3. CODE ANCHORS
 # ==============================================================================
 code_anchors:
-  period: "internal/period/period.go"
-  routing: "internal/period/routing.go"
+  bucket: "internal/bucket/bucket.go"
+  routing: "internal/bucket/routing.go"
   fsm: "internal/fsm/fsm.go"
   store: "internal/store/store.go"
   resolve: "internal/resolve/resolve.go"
@@ -93,11 +102,17 @@ code_anchors:
 # 4. VERIFICATION
 # ==============================================================================
 verification:
-  unit: "go test ./internal/period/... ./internal/fsm/..."
-  integration: "METADATA_PG_DSN=... go test -tags=integration ./internal/store/..."
+  unit: "go test ./internal/bucket/... ./internal/fsm/..."
+  integration: "METADATA_PG_DSN=... go test -tags=integration ./internal/integration/..."
   compose: "make docker-up"
 
 changelog:
+  - version: "0.3.0"
+    date: "2026-08-10"
+    changes:
+      - "Rename period_id → bucket_id (schema, API, package internal/bucket)"
+      - "mode=hash: fixed bucket_count + xxhash64, volume seal, no rebalance"
+      - "Integration test suite: internal/integration (time, numeric, hash, API)"
   - version: "0.2.0"
     date: "2026-08-07"
     changes:

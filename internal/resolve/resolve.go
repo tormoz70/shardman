@@ -7,7 +7,7 @@ import (
 
 	"github.com/tormoz70/shardman/internal/fsm"
 	"github.com/tormoz70/shardman/internal/metrics"
-	"github.com/tormoz70/shardman/internal/period"
+	"github.com/tormoz70/shardman/internal/bucket"
 	"github.com/tormoz70/shardman/internal/store"
 )
 
@@ -17,9 +17,9 @@ type Service struct {
 }
 
 type WriteResult struct {
-	Routing  period.RouteKind   `json:"routing"`
-	PeriodID string             `json:"period_id,omitempty"`
-	Reason   period.RouteReason `json:"reason,omitempty"`
+	Routing  bucket.RouteKind   `json:"routing"`
+	BucketID string             `json:"bucket_id,omitempty"`
+	Reason   bucket.RouteReason `json:"reason,omitempty"`
 	ShardID  int64              `json:"shard_id"`
 	UUID     string             `json:"shard_uuid"`
 	Endpoint string             `json:"endpoint"`
@@ -34,9 +34,9 @@ type ReadShard struct {
 }
 
 type ReadResult struct {
-	Routing  period.RouteKind   `json:"routing"`
-	PeriodID string             `json:"period_id,omitempty"`
-	Reason   period.RouteReason `json:"reason,omitempty"`
+	Routing  bucket.RouteKind   `json:"routing"`
+	BucketID string             `json:"bucket_id,omitempty"`
+	Reason   bucket.RouteReason `json:"reason,omitempty"`
 	Shards   []ReadShard        `json:"shards"`
 }
 
@@ -55,24 +55,24 @@ func (s *Service) ResolveWrite(ctx context.Context, shardKey any) (*WriteResult,
 	if cfg.RetentionDepth != nil {
 		retention = *cfg.RetentionDepth
 	}
-	if cfg.MaxFuturePeriods != nil {
-		maxFuture = *cfg.MaxFuturePeriods
+	if cfg.MaxFutureBuckets != nil {
+		maxFuture = *cfg.MaxFutureBuckets
 	}
 
-	route, err := period.ClassifyWrite(cfg.PeriodSpec, now, shardKey, retention, maxFuture)
+	route, err := bucket.ClassifyWrite(cfg.BucketSpec, now, shardKey, retention, maxFuture)
 	if err != nil {
 		return nil, err
 	}
 
-	if route.Kind == period.RouteError {
+	if route.Kind == bucket.RouteError {
 		metrics.IncErrorRoute(string(route.Reason))
 		sh, err := s.Store.GetErrorShard(ctx)
 		if err != nil {
 			return nil, err
 		}
 		return &WriteResult{
-			Routing:  period.RouteError,
-			PeriodID: period.ErrorPeriodID,
+			Routing:  bucket.RouteError,
+			BucketID: bucket.ErrorBucketID,
 			Reason:   route.Reason,
 			ShardID:  sh.ID,
 			UUID:     sh.ShardUUID.String(),
@@ -81,13 +81,13 @@ func (s *Service) ResolveWrite(ctx context.Context, shardKey any) (*WriteResult,
 		}, nil
 	}
 
-	sh, err := s.ensureActive(ctx, route.PeriodID)
+	sh, err := s.ensureActive(ctx, route.BucketID)
 	if err != nil {
 		return nil, err
 	}
 	return &WriteResult{
-		Routing:  period.RoutePeriod,
-		PeriodID: route.PeriodID,
+		Routing:  bucket.RouteBucket,
+		BucketID: route.BucketID,
 		ShardID:  sh.ID,
 		UUID:     sh.ShardUUID.String(),
 		Endpoint: store.Endpoint(sh),
@@ -110,26 +110,26 @@ func (s *Service) ResolveRead(ctx context.Context, shardKey any) (*ReadResult, e
 	if cfg.RetentionDepth != nil {
 		retention = *cfg.RetentionDepth
 	}
-	if cfg.MaxFuturePeriods != nil {
-		maxFuture = *cfg.MaxFuturePeriods
+	if cfg.MaxFutureBuckets != nil {
+		maxFuture = *cfg.MaxFutureBuckets
 	}
 
-	route, err := period.ClassifyRead(cfg.PeriodSpec, now, shardKey, retention, maxFuture)
+	route, err := bucket.ClassifyRead(cfg.BucketSpec, now, shardKey, retention, maxFuture)
 	if err != nil {
 		return nil, err
 	}
 
-	if route.Kind == period.RouteError {
-		if route.Reason == period.ReasonEvicted {
-			return &ReadResult{Routing: period.RouteError, Reason: route.Reason, Shards: nil}, nil
+	if route.Kind == bucket.RouteError {
+		if route.Reason == bucket.ReasonEvicted {
+			return &ReadResult{Routing: bucket.RouteError, Reason: route.Reason, Shards: nil}, nil
 		}
 		sh, err := s.Store.GetErrorShard(ctx)
 		if err != nil {
 			return nil, err
 		}
 		return &ReadResult{
-			Routing:  period.RouteError,
-			PeriodID: period.ErrorPeriodID,
+			Routing:  bucket.RouteError,
+			BucketID: bucket.ErrorBucketID,
 			Reason:   route.Reason,
 			Shards: []ReadShard{{
 				ShardID:  sh.ID,
@@ -140,12 +140,12 @@ func (s *Service) ResolveRead(ctx context.Context, shardKey any) (*ReadResult, e
 		}, nil
 	}
 
-	shards, err := s.Store.ShardsForPeriodRead(ctx, route.PeriodID)
+	shards, err := s.Store.ShardsForBucketRead(ctx, route.BucketID)
 	if err != nil {
 		return nil, err
 	}
 	if len(shards) == 0 {
-		promoted, err := s.ensureActive(ctx, route.PeriodID)
+		promoted, err := s.ensureActive(ctx, route.BucketID)
 		if err != nil {
 			return nil, err
 		}
@@ -162,31 +162,31 @@ func (s *Service) ResolveRead(ctx context.Context, shardKey any) (*ReadResult, e
 		})
 	}
 	return &ReadResult{
-		Routing:  period.RoutePeriod,
-		PeriodID: route.PeriodID,
+		Routing:  bucket.RouteBucket,
+		BucketID: route.BucketID,
 		Shards:   out,
 	}, nil
 }
 
-func (s *Service) ensureActive(ctx context.Context, periodID string) (*store.Shard, error) {
-	sh, err := s.Store.ActiveForPeriod(ctx, periodID)
+func (s *Service) ensureActive(ctx context.Context, BucketID string) (*store.Shard, error) {
+	sh, err := s.Store.ActiveForBucket(ctx, BucketID)
 	if err == nil {
 		return sh, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
-	promoted, err := s.Store.AutoPromoteIfNoActive(ctx, periodID)
+	promoted, err := s.Store.AutoPromoteIfNoActive(ctx, BucketID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			metrics.IncStandbyExhausted(periodID)
+			metrics.IncStandbyExhausted(BucketID)
 			return nil, store.ErrNotFound
 		}
 		return nil, err
 	}
 	if promoted != nil {
-		metrics.IncPromote(periodID)
+		metrics.IncPromote(BucketID)
 		return promoted, nil
 	}
-	return s.Store.ActiveForPeriod(ctx, periodID)
+	return s.Store.ActiveForBucket(ctx, BucketID)
 }
