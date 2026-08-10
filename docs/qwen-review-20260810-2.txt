@@ -1,0 +1,96 @@
+Видно, что вы проделали колоссальную работу: переход на **gRPC**, внедрение **OpenTelemetry**, использование `embed.FS` для миграций и паттернов вроде `FOR UPDATE SKIP LOCKED` говорят о том, что проект перешел из стадии MVP в стадию зрелой распределенной системы. 
+
+Ниже представлен **детальный code-review** с фокусом на скрытые race conditions, архитектуру и потенциальные баги в Go-коде, которые могут проявиться под нагрузкой.
+
+---
+
+### 1. CRITICAL: Удар по Metadata DB на Hot Path
+В `internal/resolve/resolve.go` при каждом резолве происходит чтение конфигурации из БД:
+```go
+func (s *Service) ResolveWrite(ctx context.Context, shardKey any) (*WriteResult, error) {
+    cfg, err := s.Store.GetConfig(ctx) // <--- SQL SELECT на каждый запрос!
+    ...
+```
+**Проблема:** `shardman-server` — это роутер. Если на него идет 10 000 RPS, он сделает 10 000 `SELECT` в таблицу `cluster_config` в секунду. Metadata DB (PostgreSQL) моментально ляжет от количества подключений и CPU-оверхеда. Конфигурация (retention, axis, spec) меняется крайне редко (только при `bootstrap` или админских действиях).
+**Решение:** 
+Реализовать in-memory кэш для `ClusterConfig` внутри `Store` или `Resolve` сервиса.
+*   При старте сервера конфиг загружается в память.
+*   Запускается фоновая горутина, которая слушает PostgreSQL `LISTEN config_changed` (или опрашивает `topology_version` раз в секунду).
+*   При изменении конфига in-memory кэш атомарно обновляется (через `atomic.Value` или `sync.RWMutex`).
+*   `ResolveWrite/Read` должны брать конфиг из памяти, а не из БД.
+
+### 2. Критический баг с парсингом Timestamps (Y2K-style Bug)
+В `internal/bucket/bucket.go` есть логика определения формата времени:
+```go
+if ms, err := strconv.ParseInt(v, 10, 64); err == nil {
+    if ms > 1_000_000_000_000 {
+        return time.UnixMilli(ms), nil
+    }
+    return time.Unix(ms, 0), nil
+}
+```
+**Проблема:** Порог `1_000_000_000_000` (один триллион) — это **сентябрь 2001 года в миллисекундах**.
+Если клиент передаст timestamp для даты из 90-х или 2000 года в миллисекундах (например, `946684800000` для 1 января 2000), условие `ms > 1_000_000_000_000` будет `false`. Код подумает, что это секунды, и вызовет `time.Unix(946684800000, 0)`. Это перенесет вас в **31688 год**, и шард-ключ улетит в совершенно другой бакет.
+**Решение:** 
+Секундный timestamp достигнет триллиона только через ~31 000 лет. Правильный порог разделения — год 3000 в секундах (`32503680000`).
+```go
+if ms > 32503680000 { // Больше года 3000 в секундах - значит это миллисекунды
+    return time.UnixMilli(ms), nil
+}
+return time.Unix(ms, 0), nil
+```
+
+### 3. Race Conditions в State Machine (`PatchState`)
+В `internal/store/store.go`:
+```go
+func (s *Store) PatchState(ctx context.Context, id int64, newState fsm.State) error {
+    sh, err := s.GetShardByID(ctx, id) // 1. Читаем стейт
+    if err := fsm.ValidateTransition(sh.Role, sh.State, newState); err != nil { return err }
+    // 2. Апдейтим стейт
+    _, err = s.pool.Exec(ctx, `UPDATE shards SET state = $1 ... WHERE id = $2`, newState, id)
+}
+```
+**Проблема:** Классическая уязвимость TOCTOU (Time-of-check to time-of-use). Между `GetShardByID` и `Exec` другой процесс (например, `seal.Supervisor`) может изменить состояние шарда. Валидация переходов FSM обходится, а оптимистичная блокировка (`version`) не проверяется.
+**Решение:** 
+Использовать транзакцию с `FOR UPDATE` и проверкой `version`:
+```go
+func (s *Store) PatchState(ctx context.Context, id int64, expectedVersion int64, newState fsm.State) error {
+    tx, err := s.pool.Begin(ctx)
+    // ...
+    var currentVersion int64
+    var currentState fsm.State
+    err = tx.QueryRow(ctx, `SELECT state, version FROM shards WHERE id = $1 FOR UPDATE`, id).Scan(&currentState, &currentVersion)
+    if err := fsm.ValidateTransition(..., currentState, newState); err != nil { tx.Rollback(ctx); return err }
+    
+    // Строгая проверка версии!
+    tag, err := tx.Exec(ctx, `UPDATE shards SET state = $1, version = version + 1 WHERE id = $2 AND version = $3`, newState, id, expectedVersion)
+    if tag.RowsAffected() == 0 { tx.Rollback(ctx); return ErrConflict }
+    // ...
+}
+```
+
+### 4. Нарушение транзакционной целостности `topology_version`
+Во многих методах (`PromoteStandbyToActive`, `SealRotate`, `CompleteDrainSeal`) инкремент версии происходит **после** коммита:
+```go
+if err := tx.Commit(ctx); err != nil { return nil, err }
+_ = s.BumpTopologyVersion(ctx) // Выполняется отдельным запросом
+```
+**Проблема:** Если сервер упадет (OOM, kill -9) в микросекунду между `tx.Commit()` и `BumpTopologyVersion()`, состояние шарда в БД обновится (станет `sealed`), но `topology_version` останется старым. Клиенты, которые кэшируют маршруты и инвалидируют кэш по `topology_version`, будут продолжать слать трафик на уже запечатанный шард, получая ошибки.
+**Решение:** 
+`BumpTopologyVersion` должен принимать `pgx.Tx` и выполняться внутри той же транзакции, до `tx.Commit()`.
+
+### 5. Консистентность хеширования (`stringifyKey`)
+В `bucket.go` при хешировании:
+```go
+case string:
+    return v, nil
+```
+**Проблема:** Клиенты на разных языках могут передавать UUID или строки в разном регистре (`"A-B-C"` vs `"a-b-c"`). `xxhash` даст разные результаты, и данные "размажет" по разным шардам.
+**Решение:** 
+Принудительно приводить строки к нижнему регистру или нормализовывать их перед хешированием, чтобы исключить человеческий фактор на стороне клиента:
+```go
+case string:
+    return strings.ToLower(v), nil
+```
+*Обязательно укажите это ограничение в документации к API (например, в proto-файлах), что ключи должны быть детерминированными.*
+
