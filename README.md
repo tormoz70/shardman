@@ -95,6 +95,8 @@ wr, _ := c.ResolveWrite(ctx, "2026-08-01T00:00:00Z")
 
 Cache topology via `Watch` or `Get`; resolve on cache miss only.
 
+Hash mode: string keys are case-insensitive (`"ABC"` and `"abc"` route to the same bucket).
+
 ## Proto / codegen
 
 ```bash

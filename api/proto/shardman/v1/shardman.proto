@@ -15,6 +15,7 @@ service ResolveService {
 }
 
 message ResolveWriteRequest {
+  // shard_key: time/numeric/hash routing input. Hash mode: string keys are lowercased before xxhash64.
   google.protobuf.Value shard_key = 1;
 }
 
@@ -29,6 +30,7 @@ message ResolveWriteResponse {
 }
 
 message ResolveReadRequest {
+  // shard_key: time/numeric/hash routing input. Hash mode: string keys are lowercased before xxhash64.
   google.protobuf.Value shard_key = 1;
 }
 

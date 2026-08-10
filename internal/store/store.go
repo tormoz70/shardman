@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,7 +55,8 @@ type Shard struct {
 }
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	configCache atomic.Value // *ClusterConfig
 }
 
 func New(ctx context.Context, dsn string) (*Store, error) {
@@ -111,6 +113,12 @@ func (s *Store) Bootstrap(ctx context.Context, cfg ClusterConfig) error {
 		return ErrAlreadyBootstrapped
 	}
 
+	spec, err := bucket.ParseSpec(cfg.BucketAxis, cfg.BucketSpecRaw)
+	if err != nil {
+		return err
+	}
+	cfg.BucketSpec = spec
+
 	_, err = tx.Exec(ctx, `
 		INSERT INTO cluster_config (mode, bucket_axis, bucket_spec, shard_max_bytes, retention_depth, max_future_buckets, topology_version)
 		VALUES ($1, $2, $3, $4, $5, $6, 1)`,
@@ -119,10 +127,27 @@ func (s *Store) Bootstrap(ctx context.Context, cfg ClusterConfig) error {
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.storeConfigCache(&cfg)
+	return nil
 }
 
-func (s *Store) GetConfig(ctx context.Context) (*ClusterConfig, error) {
+func (s *Store) storeConfigCache(cfg *ClusterConfig) {
+	if cfg == nil {
+		s.configCache.Store((*ClusterConfig)(nil))
+		return
+	}
+	cached := *cfg
+	s.configCache.Store(&cached)
+}
+
+func (s *Store) InvalidateConfigCache() {
+	s.configCache.Store((*ClusterConfig)(nil))
+}
+
+func (s *Store) loadConfigFromDB(ctx context.Context) (*ClusterConfig, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT mode, bucket_axis, bucket_spec, shard_max_bytes, retention_depth, max_future_buckets
 		FROM cluster_config WHERE id = 1`)
@@ -144,6 +169,20 @@ func (s *Store) GetConfig(ctx context.Context) (*ClusterConfig, error) {
 	}
 	cfg.BucketSpec = spec
 	return &cfg, nil
+}
+
+func (s *Store) GetConfig(ctx context.Context) (*ClusterConfig, error) {
+	if v := s.configCache.Load(); v != nil {
+		if cfg := v.(*ClusterConfig); cfg != nil {
+			return cfg, nil
+		}
+	}
+	cfg, err := s.loadConfigFromDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.storeConfigCache(cfg)
+	return cfg, nil
 }
 
 const shardCols = `id, shard_uuid, role, bucket_id, state, dsn, advertise_url, reported_bytes, max_bytes, last_seen_at, sealed_at, drain_started_at, drain_ready, version`
@@ -222,10 +261,12 @@ func (s *Store) RegisterShard(ctx context.Context, shardUUID uuid.UUID, role fsm
 	if err != nil {
 		return nil, err
 	}
+	if err := bumpTopologyVersionTx(ctx, tx); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	_ = s.BumpTopologyVersion(ctx)
 	return s.GetShardByID(ctx, id)
 }
 
@@ -332,10 +373,12 @@ func (s *Store) PromoteStandbyToActive(ctx context.Context, BucketID string) (*S
 	if err != nil {
 		return nil, err
 	}
+	if err := bumpTopologyVersionTx(ctx, tx); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	_ = s.BumpTopologyVersion(ctx)
 	return s.GetShardByID(ctx, id)
 }
 
@@ -375,6 +418,9 @@ func (s *Store) SealRotate(ctx context.Context, BucketID string) error {
 		WHERE role = 'data' AND state = 'standby' AND bucket_id IS NULL
 		ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&standbyID)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if err := bumpTopologyVersionTx(ctx, tx); err != nil {
+			return err
+		}
 		return tx.Commit(ctx)
 	}
 	if err != nil {
@@ -388,10 +434,10 @@ func (s *Store) SealRotate(ctx context.Context, BucketID string) error {
 		return err
 	}
 	_, _ = tx.Exec(ctx, `INSERT INTO shard_events (shard_id, bucket_id, event_type) VALUES ($1, $2, 'seal_rotate')`, activeID, BucketID)
-	if err := tx.Commit(ctx); err != nil {
+	if err := bumpTopologyVersionTx(ctx, tx); err != nil {
 		return err
 	}
-	return s.BumpTopologyVersion(ctx)
+	return tx.Commit(ctx)
 }
 
 func (s *Store) UpdateStats(ctx context.Context, shardUUID uuid.UUID, reportedBytes int64) error {
@@ -408,28 +454,60 @@ func (s *Store) UpdateStats(ctx context.Context, shardUUID uuid.UUID, reportedBy
 }
 
 func (s *Store) PatchState(ctx context.Context, id int64, newState fsm.State) error {
-	sh, err := s.GetShardByID(ctx, id)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if err := fsm.ValidateTransition(sh.Role, sh.State, newState); err != nil {
+	defer tx.Rollback(ctx)
+
+	var role, currentState string
+	var currentVer int64
+	err = tx.QueryRow(ctx, `
+		SELECT role, state, version FROM shards WHERE id = $1 FOR UPDATE`, id).Scan(&role, &currentState, &currentVer)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
-		UPDATE shards SET state = $1, updated_at = NOW(), version = version + 1 WHERE id = $2`,
-		newState, id)
-	return err
+	if err := fsm.ValidateTransition(fsm.Role(role), fsm.State(currentState), newState); err != nil {
+		return err
+	}
+	ct, err := tx.Exec(ctx, `
+		UPDATE shards SET state = $1, updated_at = NOW(), version = version + 1
+		WHERE id = $2 AND version = $3`, newState, id, currentVer)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	if err := bumpTopologyVersionTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) MarkBucketCleaning(ctx context.Context, BucketID string) (int64, error) {
-	ct, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	ct, err := tx.Exec(ctx, `
 		UPDATE shards SET state = 'cleaning', updated_at = NOW(), version = version + 1
 		WHERE role = 'data' AND bucket_id = $1 AND state = 'sealed'`, BucketID)
 	if err != nil {
 		return 0, err
 	}
 	if ct.RowsAffected() > 0 {
-		_ = s.BumpTopologyVersion(ctx)
+		if err := bumpTopologyVersionTx(ctx, tx); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
 	}
 	return ct.RowsAffected(), nil
 }
@@ -443,7 +521,13 @@ func (s *Store) HasActiveInBucket(ctx context.Context, bucketID string) (bool, e
 }
 
 func (s *Store) FinishCleaning(ctx context.Context, shardUUID uuid.UUID) error {
-	ct, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	ct, err := tx.Exec(ctx, `
 		UPDATE shards SET state = 'standby', bucket_id = NULL, reported_bytes = 0,
 			sealed_at = NULL, drain_started_at = NULL, drain_ready = FALSE,
 			updated_at = NOW(), version = version + 1
@@ -451,10 +535,13 @@ func (s *Store) FinishCleaning(ctx context.Context, shardUUID uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	if ct.RowsAffected() > 0 {
-		return s.BumpTopologyVersion(ctx)
+	if ct.RowsAffected() == 0 {
+		return nil
 	}
-	return nil
+	if err := bumpTopologyVersionTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) DistinctBucketIDs(ctx context.Context) ([]string, error) {
@@ -550,8 +637,19 @@ func (s *Store) BumpTopologyVersion(ctx context.Context) error {
 	return err
 }
 
+func bumpTopologyVersionTx(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `UPDATE cluster_config SET topology_version = topology_version + 1 WHERE id = 1`)
+	return err
+}
+
 func (s *Store) BeginDrain(ctx context.Context, bucketID string) error {
-	ct, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	ct, err := tx.Exec(ctx, `
 		UPDATE shards SET state = 'draining', drain_started_at = NOW(), drain_ready = FALSE,
 			updated_at = NOW(), version = version + 1
 		WHERE role = 'data' AND bucket_id = $1 AND state = 'active'`, bucketID)
@@ -561,7 +659,10 @@ func (s *Store) BeginDrain(ctx context.Context, bucketID string) error {
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return s.BumpTopologyVersion(ctx)
+	if err := bumpTopologyVersionTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) MarkDrainReady(ctx context.Context, shardUUID uuid.UUID) error {
@@ -632,10 +733,10 @@ func (s *Store) CompleteDrainSeal(ctx context.Context, bucketID string) error {
 		WHERE role = 'data' AND state = 'standby' AND bucket_id IS NULL
 		ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&standbyID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		if err := tx.Commit(ctx); err != nil {
+		if err := bumpTopologyVersionTx(ctx, tx); err != nil {
 			return err
 		}
-		return s.BumpTopologyVersion(ctx)
+		return tx.Commit(ctx)
 	}
 	if err != nil {
 		return err
@@ -648,8 +749,8 @@ func (s *Store) CompleteDrainSeal(ctx context.Context, bucketID string) error {
 		return err
 	}
 	_, _ = tx.Exec(ctx, `INSERT INTO shard_events (shard_id, bucket_id, event_type) VALUES ($1, $2, 'drain_seal')`, drainID, bucketID)
-	if err := tx.Commit(ctx); err != nil {
+	if err := bumpTopologyVersionTx(ctx, tx); err != nil {
 		return err
 	}
-	return s.BumpTopologyVersion(ctx)
+	return tx.Commit(ctx)
 }

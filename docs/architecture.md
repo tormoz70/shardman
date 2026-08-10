@@ -44,7 +44,7 @@ deploy/                  docker-compose, Prometheus, Tempo (tracing profile)
 | CLI | `cmd/shardman` | Bootstrap, register, resolve, seal-rotate, topology |
 | Client SDK | `pkg/client` | Topology cache + `Watch`, resolve, scatter helper |
 | Core | `internal/bucket`, `internal/fsm` | Bucket IDs, routing, state machine |
-| Store | `internal/store` | Metadata persistence (pgx), migrations |
+| Store | `internal/store` | Metadata persistence (pgx), migrations, in-memory `ClusterConfig` cache |
 | gRPC | `internal/grpcapi` | Service handlers |
 
 ## API
@@ -93,6 +93,16 @@ Skips buckets that still have `active` or `draining` shards.
 ## Metadata HA
 
 Production: metadata Postgres behind **PgBouncer** + external HA cluster. Shardman uses a single DSN; failover is an ops concern (no in-app reconnect logic).
+
+## Resolve hot path
+
+`cluster_config` is immutable after bootstrap. `internal/store` caches `ClusterConfig` in memory (`atomic.Value`); `Resolve.Write` / `Resolve.Read` read from cache, not metadata DB on every request.
+
+## Topology consistency
+
+Shard state changes and `topology_version` bumps run in the **same database transaction** (`RegisterShard`, promote, seal-rotate, drain seal, `PatchShardState`, retention clean). Clients invalidate route cache on `topology_version` change.
+
+`PatchShardState` uses `SELECT … FOR UPDATE` + optimistic `version` check to prevent FSM TOCTOU races.
 
 ## Client routing contract
 

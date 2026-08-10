@@ -10,6 +10,8 @@ Nesting: `shard_key → bucket_id → physical shards (standby | active | draini
 
 Time-bucket from key → `bucket_id` (e.g. `2026-08`).
 
+Numeric `shard_key` may be RFC3339 / `YYYY-MM-DD` / `YYYY-MM` strings, or Unix timestamp. Values above `32503680000` (~year 3000 in seconds) are treated as **milliseconds**; otherwise seconds.
+
 ### Numeric axis
 
 `floor(key / width)` → `bucket_id` (e.g. `n42`).
@@ -73,6 +75,7 @@ Volume subshards only; no retention ring, no error shard requirement.
 Bootstrap: `mode=hash`, `bucket_axis=hash`, `bucket_spec={bucket_count, hash_algo}`.
 
 - `bucket_id = h{hash(key) % bucket_count}` (algo: `xxhash64`)
+- String `shard_key` values are **lowercased** before hashing (deterministic routing across clients)
 - `bucket_count` **immutable** — adding physical capacity = standbys + seal-rotate, never remapping keys
 - Same volume FSM as range (incl. draining)
 - No retention ring / error shard required for MVP

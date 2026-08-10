@@ -1,6 +1,6 @@
 # Shardman — Product Contract
 
-**Version:** 0.4.0  
+**Version:** 0.4.1  
 **Date:** 2026-08-11  
 **Agent SoT:** [`.ai/master-spec.yaml`](../.ai/master-spec.yaml)
 
@@ -8,7 +8,7 @@
 
 - Go **control plane** for PostgreSQL sharding (no SQL proxy).
 - Routing slot: **`bucket_id`** (`shard_key → bucket_id → volume subshards`).
-- Modes: **`range`** (time | numeric) and **`hash`** (fixed `bucket_count`, xxhash64).
+- Modes: **`range`** (time | numeric) and **`hash`** (fixed `bucket_count`, xxhash64; string keys lowercased before hash).
 - **Time axis:** retention ring + `max_future_buckets` + dedicated **error shard**.
 - **gRPC API** for resolve, topology, admin, internal agent RPCs.
 
@@ -19,7 +19,7 @@
 3. FSM (data): `standby → active → draining → sealed → cleaning → standby`; error shard always writable.
 4. Time pool minimum: `retention_depth + 1 + max_future_buckets + 1`.
 5. `max_future_buckets = 0` → future writes route to error shard.
-6. Hash: `bucket_count` / `hash_algo` never change live (no rebalance).
+6. Hash: `bucket_count` / `hash_algo` never change live (no rebalance); string `shard_key` values are lowercased before `xxhash64`.
 7. Metadata in separate PostgreSQL (PgBouncer DSN in production).
 
 ## API (gRPC)
@@ -56,6 +56,15 @@ Clients cache topology; resolve on cache miss. Invalidate on `topology_version` 
 - **Write:** `shard_key → bucket_id → active` (auto-promote standby on miss; `Unavailable` if pool empty).
 - **Read:** `sealed ∪ active` for bucket; never `standby`.
 - **Retention:** only **sealed** shards → `cleaning`; skip bucket if `active`/`draining` present.
+- **Resolve config:** `ClusterConfig` cached in server memory after bootstrap (immutable fields).
+
+## Shard key semantics
+
+| Axis | `shard_key` input | Notes |
+|------|-------------------|-------|
+| time | RFC3339, `YYYY-MM-DD`, `YYYY-MM`, or Unix number | Numbers &gt; `32503680000` parsed as ms, else seconds |
+| numeric | integer or decimal string | `floor(key / width)` |
+| hash | string or number | strings lowercased before `xxhash64` |
 
 ## Client routing
 

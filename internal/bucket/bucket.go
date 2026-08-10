@@ -35,6 +35,10 @@ const (
 
 const HashAlgoXXHash64 = "xxhash64"
 
+// unixSecondsYear3000 is the Unix timestamp for year ~3000 in seconds.
+// Values above this threshold are treated as milliseconds in parseTimeKey.
+const unixSecondsYear3000 = 32_536_800_000
+
 type Spec struct {
 	Axis        Axis            `json:"axis"`
 	TimeUnit    TimeUnit        `json:"unit,omitempty"`
@@ -237,7 +241,7 @@ func hashKey(shardKey any, algo string) (uint64, error) {
 func stringifyKey(shardKey any) (string, error) {
 	switch v := shardKey.(type) {
 	case string:
-		return v, nil
+		return strings.ToLower(v), nil
 	case float64:
 		if v == float64(int64(v)) {
 			return strconv.FormatInt(int64(v), 10), nil
@@ -267,19 +271,19 @@ func parseTimeKey(shardKey any) (time.Time, error) {
 			return t, nil
 		}
 		if ms, err := strconv.ParseInt(v, 10, 64); err == nil {
-			if ms > 1_000_000_000_000 {
+			if ms > unixSecondsYear3000 {
 				return time.UnixMilli(ms), nil
 			}
 			return time.Unix(ms, 0), nil
 		}
 		return time.Time{}, fmt.Errorf("invalid time shard_key")
 	case float64:
-		if v > 1_000_000_000_000 {
+		if v > unixSecondsYear3000 {
 			return time.UnixMilli(int64(v)), nil
 		}
 		return time.Unix(int64(v), 0), nil
 	case int64:
-		if v > 1_000_000_000_000 {
+		if v > unixSecondsYear3000 {
 			return time.UnixMilli(v), nil
 		}
 		return time.Unix(v, 0), nil

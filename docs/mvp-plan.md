@@ -6,7 +6,7 @@
 
 **Live contract:** [master-spec.md](master-spec.md) / [`.ai/master-spec.yaml`](../.ai/master-spec.yaml).
 
-## Status (v0.4.0)
+## Status (v0.4.1)
 
 - [x] `internal/bucket` + `internal/fsm` (time/numeric/hash, draining)
 - [x] gRPC: Resolve, Topology (Get/Watch), Admin, Internal
@@ -14,11 +14,14 @@
 - [x] `cmd/agent` (`SIZE_SOURCE`), `cmd/shardman`, `pkg/client`
 - [x] Prometheus metrics + optional OTel + alert runbook
 - [x] Tests: unit, integration (`METADATA_PG_DSN`), e2e (testcontainers)
+- [x] Resolve hot path: in-memory `ClusterConfig` cache
+- [x] Hash string keys lowercased before `xxhash64`; ms/sec timestamp threshold fix
+- [x] `PatchShardState` + topology bumps transactional (same DB tx as shard updates)
 
 ## Scope
 
 - Nesting: `shard_key → bucket_id → volume subshards`
-- Modes: `range` (time|numeric) | `hash` (fixed `bucket_count`, xxhash64)
+- Modes: `range` (time|numeric) | `hash` (fixed `bucket_count`, xxhash64; string keys lowercased)
 - One active per `bucket_id`; seal-rotate без ребаланса
 - Time: retention + `max_future_buckets` + one error shard
 - Topology `Get` + `Watch` для client-side route cache

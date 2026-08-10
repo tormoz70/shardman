@@ -103,6 +103,54 @@ func TestMinShards(t *testing.T) {
 	}
 }
 
+func TestParseTimeKeyMillisecondBefore2001(t *testing.T) {
+	spec, err := ParseSpec(AxisTime, json.RawMessage(`{"unit":"day"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 946684800000 ms = 2000-01-01 UTC; must not be parsed as seconds.
+	bid, err := spec.ID(int64(946684800000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bid != "2000-01-01" {
+		t.Fatalf("got bucket %q, want 2000-01-01", bid)
+	}
+}
+
+func TestParseTimeKeySecondsStillWork(t *testing.T) {
+	spec, err := ParseSpec(AxisTime, json.RawMessage(`{"unit":"day"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 946684800 sec = 2000-01-01 UTC.
+	bid, err := spec.ID(int64(946684800))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bid != "2000-01-01" {
+		t.Fatalf("got bucket %q for sec timestamp", bid)
+	}
+}
+
+func TestHashBucketIDCaseInsensitive(t *testing.T) {
+	spec, err := ParseSpec(AxisHash, json.RawMessage(`{"bucket_count":256,"hash_algo":"xxhash64"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper, err := spec.ID("ABC-UUID")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lower, err := spec.ID("abc-uuid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upper != lower {
+		t.Fatalf("case mismatch: %q vs %q", upper, lower)
+	}
+}
+
 func TestValidateBootstrapHash(t *testing.T) {
 	if err := ValidateBootstrap(ModeHash, AxisHash, nil, nil); err != nil {
 		t.Fatal(err)
