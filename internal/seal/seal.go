@@ -38,6 +38,10 @@ func (s *Supervisor) Run(ctx context.Context) {
 	}
 }
 
+func (s *Supervisor) Tick(ctx context.Context) {
+	s.tick(ctx)
+}
+
 func (s *Supervisor) tick(ctx context.Context) {
 	cfg, err := s.Store.GetConfig(ctx)
 	if err != nil {

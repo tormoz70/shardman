@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -38,11 +39,11 @@ func TestStaleActiveExclusionAndFailover(t *testing.T) {
 	if _, err := st.RegisterShard(ctx, standbyID, fsm.RoleData, "postgres://standby/db", "", fsm.StateStandby); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SealRotate(ctx, "1"); err != nil {
+	if _, err := st.PromoteStandbyToActive(ctx, "h0"); err != nil {
 		t.Fatal(err)
 	}
 
-	active, err := st.ActiveForBucket(ctx, "1")
+	active, err := st.ActiveForBucket(ctx, "h0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,10 +51,10 @@ func TestStaleActiveExclusionAndFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := st.ActiveForBucket(ctx, "1"); err != ErrNotFound {
+	if _, err := st.ActiveForBucket(ctx, "h0"); err != ErrNotFound {
 		t.Fatalf("expected stale active excluded, got %v", err)
 	}
-	stale, err := st.StaleActiveForBucket(ctx, "1")
+	stale, err := st.StaleActiveForBucket(ctx, "h0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,15 +62,62 @@ func TestStaleActiveExclusionAndFailover(t *testing.T) {
 		t.Fatalf("stale id=%d want %d", stale.ID, active.ID)
 	}
 
-	if err := st.SealRotate(ctx, "1"); err != nil {
+	if err := st.SealRotate(ctx, "h0"); err != nil {
 		t.Fatal(err)
 	}
-	newActive, err := st.ActiveForBucket(ctx, "1")
+	newActive, err := st.ActiveForBucket(ctx, "h0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if newActive.ShardUUID == active.ShardUUID {
 		t.Fatal("expected promoted standby after stale failover")
+	}
+}
+
+func TestAutoPromoteSkipsDrainingBucket(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t, time.Minute)
+	defer st.Close()
+
+	spec, _ := json.Marshal(map[string]int64{"width": 1000})
+	if err := st.Bootstrap(ctx, ClusterConfig{
+		Mode:          bucket.ModeRange,
+		BucketAxis:    bucket.AxisNumeric,
+		BucketSpecRaw: spec,
+		ShardMaxBytes: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	activeID := uuid.New()
+	standbyID := uuid.New()
+	if _, err := st.RegisterShard(ctx, activeID, fsm.RoleData, "postgres://active/db", "", fsm.StateStandby); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RegisterShard(ctx, standbyID, fsm.RoleData, "postgres://standby/db", "", fsm.StateStandby); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PromoteStandbyToActive(ctx, "n0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BeginDrain(ctx, "n0"); err != nil {
+		t.Fatal(err)
+	}
+
+	promoted, err := st.AutoPromoteIfNoActive(ctx, "n0")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected not found during drain, got promoted=%v err=%v", promoted, err)
+	}
+	if promoted != nil {
+		t.Fatalf("expected no promotion during drain, got %+v", promoted)
+	}
+
+	standbys, err := st.CountStandbyPool(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if standbys != 1 {
+		t.Fatalf("standby pool=%d want 1", standbys)
 	}
 }
 

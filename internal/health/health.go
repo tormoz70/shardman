@@ -36,6 +36,10 @@ func (s *Supervisor) Run(ctx context.Context) {
 	}
 }
 
+func (s *Supervisor) Tick(ctx context.Context) {
+	s.tick(ctx)
+}
+
 func (s *Supervisor) tick(ctx context.Context) {
 	stale, err := s.Store.ListStaleActives(ctx)
 	if err != nil {

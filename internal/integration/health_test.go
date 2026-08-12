@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
@@ -33,8 +34,8 @@ func TestStaleActiveFailoverIntegration(t *testing.T) {
 		t.Fatal("expected stale active excluded")
 	}
 
-	healthSup := &health.Supervisor{Store: env.Store, Interval: time.Second}
-	healthSup.tick(env.Ctx)
+	healthSup := &health.Supervisor{Store: env.Store, Interval: time.Second, Log: slog.Default()}
+	healthSup.Tick(env.Ctx)
 
 	wr2, err := env.Resolver.ResolveWrite(env.Ctx, "key-a")
 	if err != nil {

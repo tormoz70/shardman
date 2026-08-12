@@ -702,6 +702,13 @@ func (s *Store) AutoPromoteIfNoActive(ctx context.Context, BucketID string) (*Sh
 	if !errors.Is(err, ErrNotFound) {
 		return nil, err
 	}
+	hasActiveOrDraining, err := s.HasActiveInBucket(ctx, BucketID)
+	if err != nil {
+		return nil, err
+	}
+	if hasActiveOrDraining {
+		return nil, ErrNotFound
+	}
 	_, err = s.StaleActiveForBucket(ctx, BucketID)
 	if err == nil {
 		return nil, ErrNotFound
